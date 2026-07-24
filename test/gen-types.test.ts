@@ -26,6 +26,10 @@ create table posts (
 );
 
 create function add_two(a int, b int) returns int language sql as $$ select a + b $$;
+
+-- interval/point start with "int"/"po" but must map to string, not number
+create function shift_window(win interval, origin point) returns int
+  language sql as $$ select 1 $$;
 `
 
 let backend: TinbaseBackend
@@ -72,6 +76,12 @@ describe('gen types', () => {
     expect(output).toContain('add_two: {')
     expect(output).toMatch(/a: number/)
     expect(output).toContain('Returns: number')
+  })
+
+  it('maps interval/point args to string, not number', () => {
+    const block = output.slice(output.indexOf('shift_window: {'))
+    expect(block).toMatch(/win: string/)
+    expect(block).toMatch(/origin: string/)
   })
 
   it('output is valid TypeScript and types a supabase-js client', () => {

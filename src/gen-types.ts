@@ -216,7 +216,9 @@ function mapArgType(type: string, enums: Set<string>, schema: string): string {
   // contain "int") are not mistyped as number.
   const t = type.toLowerCase().trim()
   if (t.endsWith('[]')) return `${mapArgType(t.slice(0, -2), enums, schema)}[]`
-  if (/^(big|small)?int/.test(t) || /^(serial|bigserial|smallserial|numeric|decimal|real|double|float)/.test(t)) return 'number'
+  // Match the integer types exactly so `interval` (which merely starts with
+  // "int") is not mistyped as number; `point` likewise falls through to string.
+  if (/^(bigint|smallint|integer|int[248]?)$/.test(t) || /^(serial|bigserial|smallserial|numeric|decimal|real|double|float)/.test(t)) return 'number'
   if (/^bool/.test(t)) return 'boolean'
   if (/^json/.test(t)) return JSON_TYPE
   return 'string'
