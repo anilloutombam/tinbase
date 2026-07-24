@@ -95,7 +95,11 @@ in the theseus native Postgres binaries or this PGlite build. Two tracks:
 
 - [ ] Bundle extension binaries (pgvector first) for native across platforms +
       a PGlite build that includes them — infra project, needed for true pgvector
-- [x] tinbase-native automation that needs no C extension, works on both engines: - [x] database webhooks (CDC → HTTP) — the Supabase webhook payload shape - [x] scheduled jobs (in-process cron running SQL) — replaces pg_cron; matches in UTC - [x] HTTP from SQL (net.http_post/get/delete → in-process sender) — pg_net emulation, so a cron job or trigger can call an Edge Function / any URL - [x] table-backed queue helpers (pgmq.\* subset) — replaces pgmq
+- [x] tinbase-native automation that needs no C extension, works on both engines:
+  - [x] database webhooks (CDC → HTTP) — the Supabase webhook payload shape
+  - [x] scheduled jobs (in-process cron running SQL) — replaces pg_cron; matches in UTC
+  - [x] HTTP from SQL (net.http_post/get/delete → in-process sender) — pg_net emulation, so a cron job or trigger can call an Edge Function / any URL
+  - [x] table-backed queue helpers (pgmq.* subset) — replaces pgmq
 - Target: AI + automation apps run unchanged
 
 ### Phase 5 — Edge Functions runtime fidelity
