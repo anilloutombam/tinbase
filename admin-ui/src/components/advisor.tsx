@@ -1,6 +1,7 @@
 import { ChevronLeft, ChevronRight, Eye, FunctionSquare, Gauge, HardDrive, Inbox, KeyRound, Lightbulb, Package, ShieldAlert, Table2 } from 'lucide-react'
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api } from '../api'
+import { pgArray } from '../lib/pg'
 import { navigate } from '../lib/router'
 import { Badge, Button, Select, Sheet, SheetClose, Spinner, Tabs, type BadgeVariant } from './ui'
 
@@ -354,7 +355,7 @@ export async function fetchFindings(): Promise<Finding[]> {
       })
     }
     if (String(p.permissive).toUpperCase() === 'PERMISSIVE') {
-      for (const role of p.roles) {
+      for (const role of pgArray(p.roles)) {
         const k = `${p.tbl}|${p.cmd}|${role}`
         permissiveGroups.set(k, (permissiveGroups.get(k) ?? 0) + 1)
       }
@@ -385,8 +386,9 @@ export async function fetchFindings(): Promise<Finding[]> {
 
   /* 0009 duplicate index */
   for (const d of rows<{ tbl: string; idxs: string[] }>(dupIdx)) {
+    const idxs = pgArray(d.idxs)
     out.push({
-      id: `0009:${d.tbl}:${d.idxs.join(',')}`,
+      id: `0009:${d.tbl}:${idxs.join(',')}`,
       code: '0009',
       category: 'performance',
       level: 'warning',
@@ -395,7 +397,7 @@ export async function fetchFindings(): Promise<Finding[]> {
       entityKind: 'table',
       issue: (
         <>
-          Table <Mono>public.{d.tbl}</Mono> has identical indexes: <Mono>{d.idxs.join(', ')}</Mono> — every extra copy slows
+          Table <Mono>public.{d.tbl}</Mono> has identical indexes: <Mono>{idxs.join(', ')}</Mono> — every extra copy slows
           writes for no read benefit.
         </>
       ),

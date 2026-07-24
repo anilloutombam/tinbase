@@ -2,6 +2,7 @@ import { AlertCircle, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
 import { Badge, Button, ConfirmDialog, Empty, Input, Label, Sheet, SheetClose, Spinner, toast } from '../../components/ui'
+import { pgArray } from '../../lib/pg'
 import { qualify } from '../../lib/schema'
 import { CatalogHeader, quoteIdent, quoteLit, useDbSchema } from './shared'
 
@@ -29,7 +30,9 @@ export function EnumsSection() {
        where n.nspname = ${quoteLit(schema)}
        group by t.typname, t.oid order by t.typname`
     )
-    setEnums(res.ok ? ((res.rows ?? []) as EnumType[]) : [])
+    // Normalize `values` to a JS array: array-typed catalog columns can arrive
+    // as a raw Postgres literal string depending on the engine/element OID.
+    setEnums(res.ok ? (res.rows ?? []).map((e) => ({ ...(e as EnumType), values: pgArray((e as EnumType).values) })) : [])
   }, [schema])
 
   useEffect(() => {

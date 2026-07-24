@@ -20,6 +20,7 @@ import {
   toast,
   TRow,
 } from '../../components/ui'
+import { pgArray } from '../../lib/pg'
 import { qualify } from '../../lib/schema'
 import { CatalogHeader, quoteIdent, quoteLit, useDbSchema } from './shared'
 
@@ -123,7 +124,7 @@ export function TriggersSection() {
                 <Td className="font-mono text-foreground/90">{t.name}</Td>
                 <Td className="font-mono text-muted-foreground">{t.table}</Td>
                 <Td className="text-muted-foreground">
-                  {t.timing} {(t.events ?? []).join(' | ')}
+                  {t.timing} {pgArray(t.events).join(' | ')}
                 </Td>
                 <Td className="font-mono text-[11px] text-muted-foreground/80">{t.function}()</Td>
                 <Td>{t.enabled ? <Badge variant="brand">enabled</Badge> : <Badge variant="neutral">disabled</Badge>}</Td>
