@@ -10,11 +10,17 @@ import type { Database } from '../db/database.js'
 /** Cap on the response body we buffer into net._http_response (bytes). */
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
+/** Max redirect hops guardedFetch will follow, re-validating each target. */
+const MAX_REDIRECTS = 5
+
 /**
- * Reject requests to non-public destinations. This is a literal-host guard
- * (loopback / private / link-local / cloud-metadata), which blocks the common
- * SSRF vectors without an async DNS lookup. Returns an error string, or null
- * when the URL is allowed.
+ * Reject requests to non-public destinations. A synchronous literal-host guard
+ * (loopback / private / link-local / cloud-metadata) that also rejects
+ * alternate numeric IP encodings which would slip past the literal checks but
+ * still connect to a real address. No DNS lookup - a public hostname that
+ * *resolves* to private space (DNS rebinding) is a residual this doesn't cover;
+ * doing so would add a per-request lookup that can hang for 30s on an
+ * unresolvable host. Returns an error string, or null when the URL is allowed.
  */
 export function blockedNetTarget(rawUrl: string): string | null {
   let u: URL
@@ -27,6 +33,13 @@ export function blockedNetTarget(rawUrl: string): string | null {
   const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '')
   if (host === 'localhost' || host.endsWith('.localhost')) return 'blocked host: localhost'
   if (isPrivateIp(host)) return `blocked host: ${host}`
+  // Reject alternate numeric encodings of an IP that pass the literal checks but
+  // still reach a real address - http://2130706433 and http://0x7f000001 both
+  // connect to 127.0.0.1. A genuine DNS name contains a letter and is not
+  // 0x-prefixed; dotted-IPv4 and IPv6 literals were already checked above.
+  if (!host.includes(':') && !/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && (host.startsWith('0x') || !/[a-z]/i.test(host))) {
+    return `blocked host: ${host} (non-DNS address encoding)`
+  }
   return null
 }
 
@@ -47,6 +60,26 @@ function isPrivateIp(host: string): boolean {
   if (host.startsWith('fe80') || host.startsWith('fc') || host.startsWith('fd')) return true // link-local / ULA
   if (host.startsWith('::ffff:')) return isPrivateIp(host.slice(7)) // IPv4-mapped
   return false
+}
+
+/**
+ * fetch with an SSRF guard that re-validates every redirect hop. Default fetch
+ * follows redirects without re-checking, so a public URL could 3xx into private
+ * space; this follows manually (capped at {@link MAX_REDIRECTS}) and runs
+ * {@link blockedNetTarget} on each target. Throws with the block reason on a
+ * rejected hop.
+ */
+export async function guardedFetch(fetchImpl: typeof fetch, url: string, init: RequestInit = {}): Promise<Response> {
+  let current = url
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const blocked = blockedNetTarget(current)
+    if (blocked) throw new Error(blocked)
+    const res = await fetchImpl(current, { ...init, redirect: 'manual' })
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null
+    if (!location) return res
+    current = new URL(location, current).toString()
+  }
+  throw new Error(`too many redirects (>${MAX_REDIRECTS})`)
 }
 
 interface RequestRow {
@@ -156,17 +189,11 @@ export class NetService {
     let timedOut = false
     let errorMsg: string | null = null
 
-    const blocked = blockedNetTarget(row.url)
-    if (blocked) {
-      clearTimeout(timer)
-      await this.record(row.id, null, null, null, content, false, blocked)
-      this.onDeliver?.({ id: row.id, method: row.method, url: row.url, timedOut: false, error: blocked })
-      return
-    }
-
     try {
       const hasBody = row.method !== 'GET' && row.method !== 'HEAD'
-      const res = await this.fetchImpl(row.url, {
+      // guardedFetch enforces the SSRF policy on the initial URL and every
+      // redirect hop (a plain fetch would follow a 3xx into private space).
+      const res = await guardedFetch(this.fetchImpl, row.url, {
         method: row.method,
         headers,
         body: hasBody ? row.body ?? undefined : undefined,

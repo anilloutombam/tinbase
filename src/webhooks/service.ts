@@ -6,7 +6,7 @@
  * webhook payload exactly: { type, table, schema, record, old_record }.
  */
 import type { CdcEvent, Database } from '../db/database.js'
-import { blockedNetTarget } from '../net/service.js'
+import { guardedFetch } from '../net/service.js'
 
 /** A registered database webhook: which changes to watch and where to POST them. */
 export interface WebhookConfig {
@@ -109,20 +109,20 @@ export class WebhooksService {
       record: event.record ?? null,
       old_record: event.old_record ?? null,
     }
-    const blocked = this.restrictTargets ? blockedNetTarget(hook.url) : null
-    if (blocked) {
-      this.onDelivery?.({ webhook: hook, event, status: null, ok: false, error: blocked })
-      return
-    }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), hook.timeoutMs ?? 5000)
     try {
-      const res = await this.fetchImpl(hook.url, {
+      const init: RequestInit = {
         method: hook.method ?? 'POST',
         headers: { 'content-type': 'application/json', ...(hook.headers ?? {}) },
         body: JSON.stringify(payload),
         signal: controller.signal,
-      })
+      }
+      // When network-exposed, apply the SSRF guard (incl. redirect re-validation);
+      // on loopback dev, deliver directly so localhost webhooks still work.
+      const res = this.restrictTargets
+        ? await guardedFetch(this.fetchImpl, hook.url, init)
+        : await this.fetchImpl(hook.url, init)
       this.onDelivery?.({ webhook: hook, event, status: res.status, ok: res.ok })
     } catch (e) {
       this.onDelivery?.({

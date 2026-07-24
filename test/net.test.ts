@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createBackend, type TinbaseBackend } from '../src/index.js'
-import { blockedNetTarget } from '../src/net/service.js'
+import { blockedNetTarget, guardedFetch } from '../src/net/service.js'
 
 interface Captured {
   url: string
@@ -116,5 +116,47 @@ describe('pg_net emulation (net.http_*)', () => {
     await expect(
       backend.db.withContext(ctx, (q) => q(`select cron.schedule('evil', '1 seconds', 'select 1')`))
     ).rejects.toThrow()
+  })
+})
+
+describe('SSRF guard: encodings + redirect re-validation', () => {
+  it('rejects alternate numeric IP encodings that reach loopback', () => {
+    expect(blockedNetTarget('http://2130706433/')).toBeTruthy() // 127.0.0.1 as a decimal int
+    expect(blockedNetTarget('http://0x7f000001/')).toBeTruthy() // 127.0.0.1 as hex
+    expect(blockedNetTarget('http://169.254.169.254/')).toBeTruthy() // literal metadata still caught
+    expect(blockedNetTarget('http://93.184.216.34/')).toBeNull() // literal public IP allowed
+    expect(blockedNetTarget('https://api.example.com/')).toBeNull() // real DNS name allowed
+  })
+
+  it('guardedFetch throws on the initial blocked target without calling fetch', async () => {
+    let calls = 0
+    const fetchImpl: typeof fetch = async () => {
+      calls++
+      return new Response('x')
+    }
+    await expect(guardedFetch(fetchImpl, 'http://169.254.169.254/')).rejects.toThrow(/blocked/)
+    expect(calls).toBe(0)
+  })
+
+  it('guardedFetch refuses a redirect into a private target', async () => {
+    let calls = 0
+    const fetchImpl: typeof fetch = async () => {
+      calls++
+      return new Response(null, { status: 302, headers: { location: 'http://169.254.169.254/' } })
+    }
+    await expect(guardedFetch(fetchImpl, 'http://93.184.216.34/start')).rejects.toThrow(/blocked/)
+    expect(calls).toBe(1) // stopped before following into the metadata IP
+  })
+
+  it('guardedFetch follows a redirect to another public target', async () => {
+    const responses = [
+      new Response(null, { status: 302, headers: { location: 'http://93.184.216.34/b' } }),
+      new Response('ok', { status: 200 }),
+    ]
+    let i = 0
+    const fetchImpl: typeof fetch = async () => responses[i++]
+    const res = await guardedFetch(fetchImpl, 'http://93.184.216.34/a')
+    expect(res.status).toBe(200)
+    expect(i).toBe(2)
   })
 })
