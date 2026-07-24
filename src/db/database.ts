@@ -44,6 +44,13 @@ export interface TableInfo {
   name: string
   columns: ColumnInfo[]
   primaryKey: string[]
+  /**
+   * Column-sets with a uniqueness guarantee (each PRIMARY KEY / UNIQUE
+   * constraint, columns in definition order). Used to decide embed cardinality:
+   * a foreign key whose columns are a unique key on the referencing side is a
+   * one-to-one relationship (PostgREST serializes it as an object, not array).
+   */
+  uniqueKeys: string[][]
 }
 
 /** One argument of a database function. */
@@ -303,6 +310,32 @@ export class Database {
       [schema]
     )
 
+    // PRIMARY KEY + UNIQUE constraints, grouped per constraint (in column order)
+    // so embed cardinality can tell one-to-one from one-to-many.
+    const uniq = await this.engine.query<{
+      table_name: string
+      constraint_name: string
+      column_name: string
+      ordinal: number
+    }>(
+      `select kcu.table_name, kcu.constraint_name, kcu.column_name, kcu.ordinal_position as ordinal
+       from information_schema.table_constraints tc
+       join information_schema.key_column_usage kcu
+         on kcu.constraint_name = tc.constraint_name
+        and kcu.constraint_schema = tc.constraint_schema
+       where tc.constraint_type in ('PRIMARY KEY', 'UNIQUE') and tc.table_schema = $1
+       order by kcu.constraint_name, kcu.ordinal_position`,
+      [schema]
+    )
+    // table -> constraint -> ordered column list
+    const uniqByTable = new Map<string, Map<string, string[]>>()
+    for (const u of uniq.rows) {
+      if (!uniqByTable.has(u.table_name)) uniqByTable.set(u.table_name, new Map())
+      const byConstraint = uniqByTable.get(u.table_name)!
+      if (!byConstraint.has(u.constraint_name)) byConstraint.set(u.constraint_name, [])
+      byConstraint.get(u.constraint_name)!.push(u.column_name)
+    }
+
     const fks = await this.engine.query<{
       constraint_name: string
       src_schema: string
@@ -347,6 +380,7 @@ export class Database {
           name: c.table_name,
           columns: [],
           primaryKey: [...(pkSet.get(c.table_name) ?? [])],
+          uniqueKeys: [...(uniqByTable.get(c.table_name)?.values() ?? [])],
         })
       }
       tables.get(c.table_name)!.columns.push({
