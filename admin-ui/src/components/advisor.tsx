@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api } from '../api'
 import { pgArray } from '../lib/pg'
 import { navigate } from '../lib/router'
-import { Badge, Button, Select, Sheet, SheetClose, Spinner, Tabs, type BadgeVariant } from './ui'
+import { Badge, Button, LoadError, Select, Sheet, SheetClose, Spinner, Tabs, type BadgeVariant } from './ui'
 
 /* ── findings engine ─────────────────────────────────────────────────────────
  * Local implementation of Supabase's database-advisor lints
@@ -140,6 +140,16 @@ export async function fetchFindings(): Promise<Finding[]> {
       ),
       api.authConfig(),
     ])
+
+  // If we can't even read the table catalog, the Advisor can't assess anything -
+  // throw so callers surface an error rather than an empty (healthy-looking) list.
+  if (tables.status === 'rejected' || !tables.value.ok) {
+    const reason =
+      tables.status === 'rejected'
+        ? String((tables.reason as Error)?.message ?? tables.reason)
+        : ((tables.value as { error?: string }).error ?? 'catalog unreachable')
+    throw new Error(reason)
+  }
 
   const out: Finding[] = []
   const rows = <T,>(r: PromiseSettledResult<{ ok: boolean; rows?: unknown[] }>): T[] =>
@@ -713,12 +723,22 @@ export function AdvisorHost() {
 
 function AdvisorSheet({ onClose }: { onClose: () => void }) {
   const [findings, setFindings] = useState<Finding[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [category, setCategory] = useState<'all' | FindingCategory>('all')
   const [level, setLevel] = useState<'' | FindingLevel>('')
   const [selected, setSelected] = useState<Finding | null>(null)
 
   const load = useCallback(() => {
-    fetchFindings().then(setFindings, () => setFindings([]))
+    fetchFindings().then(
+      (fs) => {
+        setError(null)
+        setFindings(fs)
+      },
+      (e) => {
+        setError((e as Error)?.message ?? 'Advisor could not read the catalog')
+        setFindings([])
+      }
+    )
   }, [])
 
   useEffect(() => {
@@ -821,7 +841,9 @@ function AdvisorSheet({ onClose }: { onClose: () => void }) {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {findings === null ? (
+              {error ? (
+                <LoadError message={error} />
+              ) : findings === null ? (
                 <div className="p-5">
                   <Spinner />
                 </div>

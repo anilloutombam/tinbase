@@ -4,6 +4,7 @@ import {
   Empty,
   Input,
   Label,
+  LoadError,
   Sheet,
   SheetClose,
   Spinner,
@@ -36,6 +37,7 @@ const VALID_QUEUE = /^[a-z_][a-z0-9_-]{0,46}$/i;
 /** pgmq queues: list with depth, create, send test messages, peek, purge. */
 export function QueuesSection() {
   const [queues, setQueues] = useState<Queue[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [sendingTo, setSendingTo] = useState<Queue | null>(null);
   const [peeking, setPeeking] = useState<Queue | null>(null);
@@ -49,6 +51,7 @@ export function QueuesSection() {
        where t.table_schema = 'pgmq' and t.table_name like 'q\\_%' order by 1`,
     );
     if (res.ok) {
+      setError(null);
       setQueues(
         ((res.rows ?? []) as { name: string; depth: number }[]).map((r) => ({
           ...r,
@@ -63,9 +66,11 @@ export function QueuesSection() {
        where table_schema = 'pgmq' and table_name like 'q\\_%' order by 1`,
     );
     if (!names.ok) {
-      setQueues([]);
+      setError(names.error ?? "Query failed");
+      setQueues((cur) => cur ?? []);
       return;
     }
+    setError(null);
     const out: Queue[] = [];
     for (const r of (names.rows ?? []) as { name: string }[]) {
       if (!VALID_QUEUE.test(r.name)) continue;
@@ -113,6 +118,7 @@ export function QueuesSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 overflow-auto">
         <Table>
           <THead>

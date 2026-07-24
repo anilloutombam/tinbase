@@ -9,6 +9,7 @@ import {
   Empty,
   Input,
   Label,
+  LoadError,
   Select,
   Sheet,
   SheetClose,
@@ -37,6 +38,7 @@ interface Trigger {
 export function TriggersSection() {
   const [schema] = useDbSchema()
   const [rows, setRows] = useState<Trigger[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
   const [dropping, setDropping] = useState<Trigger | null>(null)
@@ -57,7 +59,13 @@ export function TriggersSection() {
        where n.nspname = ${quoteLit(schema)} and not tg.tgisinternal
        order by c.relname, tg.tgname`
     )
-    setRows(res.ok ? ((res.rows ?? []) as Trigger[]) : [])
+    if (!res.ok) {
+      setError(res.error ?? 'Query failed')
+      setRows((cur) => cur ?? [])
+      return
+    }
+    setError(null)
+    setRows((res.rows ?? []) as Trigger[])
   }, [schema])
 
   useEffect(() => {
@@ -106,6 +114,7 @@ export function TriggersSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 overflow-auto">
         <Table>
           <THead>

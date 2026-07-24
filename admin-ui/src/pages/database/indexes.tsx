@@ -7,6 +7,7 @@ import {
   ConfirmDialog,
   Empty,
   Label,
+  LoadError,
   Select,
   Sheet,
   SheetClose,
@@ -31,6 +32,7 @@ interface Index {
 export function IndexesSection() {
   const [schema] = useDbSchema()
   const [rows, setRows] = useState<Index[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
   const [dropping, setDropping] = useState<Index | null>(null)
@@ -41,7 +43,13 @@ export function IndexesSection() {
               exists (select 1 from pg_constraint c where c.conname = i.indexname) as constraint
        from pg_indexes i where i.schemaname = ${quoteLit(schema)} order by i.tablename, i.indexname`
     )
-    setRows(res.ok ? ((res.rows ?? []) as Index[]) : [])
+    if (!res.ok) {
+      setError(res.error ?? 'Query failed')
+      setRows((cur) => cur ?? [])
+      return
+    }
+    setError(null)
+    setRows((res.rows ?? []) as Index[])
   }, [schema])
 
   useEffect(() => {
@@ -78,6 +86,7 @@ export function IndexesSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 overflow-auto">
         <Table>
           <THead>

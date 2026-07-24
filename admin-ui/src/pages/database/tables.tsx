@@ -1,7 +1,7 @@
 import { ArrowUpRight, Eye, KeyRound, Lock, Table2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
-import { Badge, Empty, Spinner, Table, Td, Th, THead, TRow } from '../../components/ui'
+import { Badge, Empty, LoadError, Spinner, Table, Td, Th, THead, TRow } from '../../components/ui'
 import { navigate } from '../../lib/router'
 import { isManagedSchema } from '../../lib/schema'
 import { CatalogHeader, quoteLit, useDbSchema } from './shared'
@@ -22,6 +22,7 @@ interface Row {
 export function TablesSection() {
   const [schema] = useDbSchema()
   const [rows, setRows] = useState<Row[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
 
   const load = useCallback(async () => {
@@ -37,6 +38,7 @@ export function TablesSection() {
            where n.nspname = ${quoteLit(schema)} and c.relkind in ('r','v') order by c.relname`
         ),
       ])
+      setError(meta.ok ? null : (meta.error ?? 'Query failed'))
       const metaMap = new Map(
         ((meta.ok ? meta.rows : []) ?? []).map(
           (m: { name: string; rls: boolean; invoker: boolean; size: string; policies: number }) => [m.name, m]
@@ -57,8 +59,9 @@ export function TablesSection() {
           }
         })
       )
-    } catch {
-      setRows([])
+    } catch (e) {
+      setError((e as Error)?.message ?? 'Query failed')
+      setRows((cur) => cur ?? [])
     }
   }, [schema])
 
@@ -84,6 +87,7 @@ export function TablesSection() {
         onRefresh={() => void load()}
         schemaPicker
       />
+      {error && <LoadError message={error} />}
       {managed && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-accent/40 px-6 py-2 text-xs text-muted-foreground">
           <Lock size={13} className="shrink-0" />

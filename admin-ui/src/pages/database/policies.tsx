@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
 import { PolicyEditorSheet } from '../../components/policy-editor'
 import { policyToDraft } from '../../components/rls'
-import { Badge, Button, ConfirmDialog, Empty, Spinner, toast } from '../../components/ui'
+import { Badge, Button, ConfirmDialog, Empty, LoadError, Spinner, toast } from '../../components/ui'
 import { CatalogHeader, useDbSchema } from './shared'
 
 interface Policy {
@@ -20,6 +20,7 @@ interface Policy {
 export function PoliciesSection() {
   const [schema] = useDbSchema()
   const [policies, setPolicies] = useState<Policy[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [tables, setTables] = useState<string[]>([])
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
@@ -29,11 +30,15 @@ export function PoliciesSection() {
   const load = useCallback(() => {
     Promise.all([api.policies(schema), api.tables(schema)]).then(
       ([p, t]) => {
+        setError(null)
         setPolicies(p as Policy[])
         // policies attach to tables only — views can't have RLS
         setTables(t.filter((x) => !x.isView).map((x) => x.name))
       },
-      () => setPolicies([])
+      (e) => {
+        setError((e as Error)?.message ?? 'Query failed')
+        setPolicies((cur) => cur ?? [])
+      }
     )
   }, [schema])
 
@@ -79,6 +84,7 @@ export function PoliciesSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-6">
         {[...byTable].map(([table, ps]) => (
           <div key={table}>

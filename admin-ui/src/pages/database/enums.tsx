@@ -1,7 +1,7 @@
 import { AlertCircle, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
-import { Badge, Button, ConfirmDialog, Empty, Input, Label, Sheet, SheetClose, Spinner, toast } from '../../components/ui'
+import { Badge, Button, ConfirmDialog, Empty, Input, Label, LoadError, Sheet, SheetClose, Spinner, toast } from '../../components/ui'
 import { pgArray } from '../../lib/pg'
 import { qualify } from '../../lib/schema'
 import { CatalogHeader, quoteIdent, quoteLit, useDbSchema } from './shared'
@@ -16,6 +16,7 @@ interface EnumType {
 export function EnumsSection() {
   const [schema] = useDbSchema()
   const [enums, setEnums] = useState<EnumType[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<EnumType | null>(null)
@@ -32,7 +33,13 @@ export function EnumsSection() {
     )
     // Normalize `values` to a JS array: array-typed catalog columns can arrive
     // as a raw Postgres literal string depending on the engine/element OID.
-    setEnums(res.ok ? (res.rows ?? []).map((e) => ({ ...(e as EnumType), values: pgArray((e as EnumType).values) })) : [])
+    if (!res.ok) {
+      setError(res.error ?? 'Query failed')
+      setEnums((cur) => cur ?? [])
+      return
+    }
+    setError(null)
+    setEnums((res.rows ?? []).map((e) => ({ ...(e as EnumType), values: pgArray((e as EnumType).values) })))
   }, [schema])
 
   useEffect(() => {
@@ -69,6 +76,7 @@ export function EnumsSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-6">
         {visible.map((e) => (
           <div key={e.name} className="rounded-md border border-border bg-card p-4">

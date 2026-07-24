@@ -1,7 +1,7 @@
 import { ChevronDown, ChevronRight, Plus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
-import { Badge, Button, ConfirmDialog, Empty, Input, Label, Sheet, SheetClose, Spinner, Switch, toast } from '../../components/ui'
+import { Badge, Button, ConfirmDialog, Empty, Input, Label, LoadError, Sheet, SheetClose, Spinner, Switch, toast } from '../../components/ui'
 import { CatalogHeader, quoteIdent } from './shared'
 
 interface Role {
@@ -36,6 +36,7 @@ const PRIVS = [
 /** Database roles: grouped managed vs custom, expandable privileges, create/edit/drop. */
 export function RolesSection() {
   const [rows, setRows] = useState<Role[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -50,7 +51,13 @@ export function RolesSection() {
               coalesce((select count(*)::int from pg_stat_activity a where a.usename = r.rolname), 0) as connections
        from pg_roles r where r.rolname not like 'pg\\_%' order by r.rolname`
     )
-    setRows(res.ok ? ((res.rows ?? []) as Role[]) : [])
+    if (!res.ok) {
+      setError(res.error ?? 'Query failed')
+      setRows((cur) => cur ?? [])
+      return
+    }
+    setError(null)
+    setRows((res.rows ?? []) as Role[])
   }, [])
 
   useEffect(() => {
@@ -153,6 +160,7 @@ export function RolesSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-6">
         <div>
           <div className="mb-1.5 flex items-center gap-2">

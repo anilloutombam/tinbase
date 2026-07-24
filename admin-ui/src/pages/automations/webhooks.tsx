@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
-import { Badge, Empty, Spinner, Table, Td, Th, THead, Time, TRow } from '../../components/ui'
+import { Badge, Empty, LoadError, Spinner, Table, Td, Th, THead, Time, TRow } from '../../components/ui'
 import { CatalogHeader } from '../database/shared'
 
 interface Hook {
@@ -21,6 +21,7 @@ interface Delivery {
 export function WebhooksSection() {
   const [hooks, setHooks] = useState<Hook[] | null>(null)
   const [deliveries, setDeliveries] = useState<Delivery[]>([])
+  const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     const [h, d] = await Promise.allSettled([
@@ -28,7 +29,13 @@ export function WebhooksSection() {
       api.sql(`select id, status_code, timed_out, error_msg, created from net._http_response order by id desc limit 50`),
     ])
     setHooks(h.status === 'fulfilled' ? h.value : [])
-    setDeliveries(d.status === 'fulfilled' && d.value.ok ? ((d.value.rows ?? []) as Delivery[]) : [])
+    // deliveries is the primary signal — a failed fetch shouldn't look like "none yet"
+    if (d.status === 'fulfilled' && d.value.ok) {
+      setError(null)
+      setDeliveries((d.value.rows ?? []) as Delivery[])
+    } else {
+      setError((d.status === 'fulfilled' ? d.value.error : (d.reason as Error)?.message) ?? 'Query failed')
+    }
   }, [])
 
   useEffect(() => {
@@ -44,6 +51,7 @@ export function WebhooksSection() {
         description="Fire HTTP requests on table changes (CDC → HTTP) — configured via supabase/webhooks.json or createBackend({ webhooks })."
         onRefresh={() => void load()}
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Table>
           <THead>

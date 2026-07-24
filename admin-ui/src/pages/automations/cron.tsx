@@ -1,7 +1,7 @@
 import { Plus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
-import { Badge, Button, CodeEditor, ConfirmDialog, Empty, Input, Label, Sheet, SheetClose, Spinner, Table, Td, Th, THead, Time, toast, TRow } from '../../components/ui'
+import { Badge, Button, CodeEditor, ConfirmDialog, Empty, Input, Label, LoadError, Sheet, SheetClose, Spinner, Table, Td, Th, THead, Time, toast, TRow } from '../../components/ui'
 import { CatalogHeader, quoteLit } from '../database/shared'
 
 interface Job {
@@ -24,6 +24,7 @@ interface Run {
 export function CronSection() {
   const [jobs, setJobs] = useState<Job[] | null>(null)
   const [runs, setRuns] = useState<Run[]>([])
+  const [error, setError] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [removing, setRemoving] = useState<Job | null>(null)
 
@@ -32,8 +33,16 @@ export function CronSection() {
       api.sql(`select jobid, jobname, schedule, command, active from cron.job order by jobid`),
       api.sql(`select jobid, status, return_message, start_time, end_time from cron.job_run_details order by start_time desc limit 50`),
     ])
-    setJobs(j.ok ? ((j.rows ?? []) as Job[]) : [])
-    setRuns(r.ok ? ((r.rows ?? []) as Run[]) : [])
+    if (!j.ok || !r.ok) {
+      setError(j.error ?? r.error ?? 'Query failed')
+      setJobs((cur) => cur ?? [])
+      if (j.ok) setJobs((j.rows ?? []) as Job[])
+      if (r.ok) setRuns((r.rows ?? []) as Run[])
+      return
+    }
+    setError(null)
+    setJobs((j.rows ?? []) as Job[])
+    setRuns((r.rows ?? []) as Run[])
   }, [])
 
   useEffect(() => {
@@ -64,6 +73,7 @@ export function CronSection() {
           </Button>
         }
       />
+      {error && <LoadError message={error} />}
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Table>
           <THead>
