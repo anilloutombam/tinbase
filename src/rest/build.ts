@@ -28,6 +28,12 @@ interface Relationship {
   junction?: { table: string; fkToBase: ForeignKey; fkToTarget: ForeignKey }
   /** name of the embedded target table */
   targetTable: string
+  /**
+   * True when the relationship yields at most one row and must serialize as a
+   * single object, not an array. Always so for `to-one`; also for a `to-many`
+   * whose fk on the target is a unique key (a one-to-one, per PostgREST).
+   */
+  single?: boolean
 }
 
 /** A built SQL statement plus its bind params and an optional separate count query. */
@@ -356,9 +362,9 @@ export class QueryBuilder {
     const outName = embed.alias ?? embed.name
 
     if (embed.spread) {
-      // to-one spreads a single row's columns; to-many / m2m aggregate each
-      // spread column into a JSON array (PostgREST's spread-to-many behavior).
-      const toOne = rel.type === 'to-one'
+      // a single-valued embed (to-one, or a one-to-one reverse embed) spreads
+      // one row's columns; to-many / m2m aggregate each into a JSON array.
+      const toOne = rel.single === true
       const exprs = children.map((c) => {
         if (c.kind !== 'column' || c.name === '*') {
           throw new ParseError('spread embeds support explicit columns only')
@@ -376,12 +382,20 @@ export class QueryBuilder {
 
     const sub = `select ${childExprs.join(', ')} from ${fromClause}${where}${order}${limitOffset}`
     const expr =
-      rel.type === 'to-one'
+      rel.single === true
         ? `(select row_to_json(_sub) from (${sub}) _sub) as ${quoteIdent(outName)}`
         : `coalesce((select json_agg(row_to_json(_sub)) from (${sub}) _sub), ${AGG_EMPTY}) as ${quoteIdent(outName)}`
 
     const innerCond = embed.inner ? `exists (select 1 from ${fromClause}${where})` : undefined
     return { exprs: [expr], innerCond }
+  }
+
+  /** Whether `columns` (order-independent) form a PK/UNIQUE key on `table`. */
+  private isUniqueKey(table: string, columns: string[]): boolean {
+    const t = this.info.tables.get(table)
+    if (!t) return false
+    const want = [...columns].sort().join(' ')
+    return t.uniqueKeys.some((key) => key.length === columns.length && [...key].sort().join(' ') === want)
   }
 
   private findRelationship(baseTable: string, embed: SelectEmbed): Relationship {
@@ -392,10 +406,12 @@ export class QueryBuilder {
     for (const fk of fks) {
       if (fk.srcSchema === this.schema && fk.tgtSchema === this.schema) {
         if (fk.srcTable === baseTable && fk.tgtTable === target) {
-          candidates.push({ type: 'to-one', fk, targetTable: target })
+          candidates.push({ type: 'to-one', fk, targetTable: target, single: true })
         }
         if (fk.srcTable === target && fk.tgtTable === baseTable) {
-          candidates.push({ type: 'to-many', fk, targetTable: target })
+          // A reverse embed is normally one-to-many (array), but when the fk on
+          // the target is itself a unique key it's one-to-one -> single object.
+          candidates.push({ type: 'to-many', fk, targetTable: target, single: this.isUniqueKey(target, fk.srcColumns) })
         }
       }
     }
