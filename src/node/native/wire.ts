@@ -401,7 +401,7 @@ function parseErrorFields(payload: Buffer): Map<string, string> {
 }
 
 /** Decode a text-format value by type OID to match PGlite's JS types. */
-function decodeValue(text: string, oid: number): unknown {
+export function decodeValue(text: string, oid: number): unknown {
   switch (oid) {
     case 16: // bool
       return text === 't'
@@ -433,8 +433,13 @@ function decodeValue(text: string, oid: number): unknown {
     case 1000: // _bool
       return parsePgArray(text).map((v) => v === 't')
     case 1007: // _int4
-    case 1016: // _int8
       return parsePgArray(text).map((v) => (v === null ? null : Number(v)))
+    case 1016: // _int8: preserve values beyond 2^53 as strings, matching the scalar int8 case
+      return parsePgArray(text).map((v) => {
+        if (v === null) return null
+        const n = Number(v)
+        return Number.isSafeInteger(n) ? n : v
+      })
     case 1003: // _name (e.g. array_agg over pg_enum.enumlabel / catalog name columns)
     case 1009: // _text
     case 1015: // _varchar
