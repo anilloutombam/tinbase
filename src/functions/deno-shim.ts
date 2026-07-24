@@ -14,32 +14,27 @@
  * a function using those needs a bundling step. Functions that stick to Web
  * APIs (fetch/Request/Response) + Deno.serve/Deno.env work as-is.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 type DenoHandler = (req: Request) => Response | Promise<Response>
 
 const captured: { handler?: DenoHandler } = {}
 
-// The Deno global is installed once per process, but each backend has its own
-// function env. `activeEnv` is the env the shim's Deno.env currently reads from;
-// it's swapped to the invoking backend's env for the duration of each call (see
-// runWithDenoEnv). Defaults to empty so a stray Deno.env read outside any
-// invocation sees nothing rather than another backend's secrets.
-let activeEnv: Record<string, string> = {}
+// The Deno global is installed once per process, but each backend (and each
+// in-flight invocation) has its own function env. An AsyncLocalStorage scopes
+// the env to the invocation's async context, so it stays correct across awaits
+// even when two invocations interleave on the event loop - a module-global that
+// was swapped around `await` would let a later call overwrite an earlier call's
+// env mid-flight. A Deno.env read outside any invocation sees an empty env.
+const envStore = new AsyncLocalStorage<Record<string, string>>()
 
 /**
- * Run `fn` with the shim's Deno.env bound to `env`, restoring the previous env
- * afterwards. This keeps Deno.env scoped to the backend handling the request so
- * one backend can't read another's (or the host's) secrets. Invocations are not
- * concurrent within a single synchronous dispatch, but we still restore in a
- * finally to survive throws and nested calls.
+ * Run `fn` with the shim's Deno.env bound to `env`. The binding lives in an
+ * async-context store, so concurrent invocations each read their own env and
+ * one backend can never observe another's (or the host's) secrets.
  */
-export async function runWithDenoEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
-  const prev = activeEnv
-  activeEnv = env
-  try {
-    return await fn()
-  } finally {
-    activeEnv = prev
-  }
+export function runWithDenoEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  return envStore.run(env, fn)
 }
 
 /** Install globalThis.Deno if we're not already running under a Deno-like runtime. */
@@ -60,15 +55,17 @@ export function installDenoShim(): void {
     // process.env, so a function can't read arbitrary server-side env (cloud
     // credentials, DB URLs, etc.).
     env: {
-      get: (k: string) => activeEnv[k],
+      get: (k: string) => envStore.getStore()?.[k],
       set: (k: string, v: string) => {
-        activeEnv[k] = v
+        const s = envStore.getStore()
+        if (s) s[k] = v
       },
-      has: (k: string) => activeEnv[k] !== undefined,
+      has: (k: string) => envStore.getStore()?.[k] !== undefined,
       delete: (k: string) => {
-        delete activeEnv[k]
+        const s = envStore.getStore()
+        if (s) delete s[k]
       },
-      toObject: () => ({ ...activeEnv }),
+      toObject: () => ({ ...(envStore.getStore() ?? {}) }),
     },
     // enough of the surface that idiomatic functions don't crash on reference
     cwd: () => process.cwd(),
