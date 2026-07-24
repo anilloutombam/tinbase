@@ -50,6 +50,15 @@ describe('auth', () => {
     await env.supabase.auth.signOut()
   })
 
+  it('populates identities with an email provider after email signup', async () => {
+    await env.supabase.auth.signUp({ email: 'identity@example.com', password: 'password123' })
+    const { data } = await env.supabase.auth.getUser()
+    const identities = data.user?.identities ?? []
+    expect(identities.some((i) => i.provider === 'email')).toBe(true)
+    expect(identities[0]?.identity_data?.email).toBe('identity@example.com')
+    await env.supabase.auth.signOut()
+  })
+
   it('updates user metadata and password', async () => {
     await env.supabase.auth.signInWithPassword({ email: 'test@example.com', password: 'password123' })
     const upd = await env.supabase.auth.updateUser({ data: { plan: 'pro' }, password: 'newpassword456' })

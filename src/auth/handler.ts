@@ -246,6 +246,15 @@ export class AuthHandler {
       [email, hashed, JSON.stringify(body.data ?? {}), autoconfirm]
     )
     const newUser = res.rows[0] as UserRow
+    // GoTrue records an `email` identity at signup, so user.identities reflects
+    // the email provider (getUser returned [] before this). Mirrors the shape
+    // written on anonymous-to-email upgrade.
+    await this.db.query(
+      `insert into auth.identities (user_id, provider, provider_id, identity_data)
+       values ($1, 'email', $2, $3)
+       on conflict (provider, provider_id) do nothing`,
+      [newUser.id, newUser.id, JSON.stringify({ sub: newUser.id, email: newUser.email })]
+    )
     await this.audit('user_signedup', { actorId: newUser.id, actorEmail: email })
     if (!autoconfirm) {
       // confirmation required: email a verification link/code; no session yet
