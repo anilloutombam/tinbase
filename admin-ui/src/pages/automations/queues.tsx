@@ -17,7 +17,7 @@ import {
   ValueCell,
   toast,
 } from "../../components/ui";
-import { CatalogHeader, quoteLit } from "../database/shared";
+import { CatalogHeader, quoteIdent, quoteLit } from "../database/shared";
 import { Eye, Plus, Send, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
@@ -29,7 +29,9 @@ interface Queue {
   archived: number;
 }
 
-const VALID_QUEUE = /^[a-z_][a-z0-9_]{0,46}$/;
+// pgmq queue names may contain hyphens (e.g. the demo's `image-processing`), so
+// allow them here; the identifier is still quoted with quoteIdent at every use.
+const VALID_QUEUE = /^[a-z_][a-z0-9_-]{0,46}$/i;
 
 /** pgmq queues: list with depth, create, send test messages, peek, purge. */
 export function QueuesSection() {
@@ -68,7 +70,7 @@ export function QueuesSection() {
     for (const r of (names.rows ?? []) as { name: string }[]) {
       if (!VALID_QUEUE.test(r.name)) continue;
       const c = await api.sql(
-        `select count(*)::int as depth from pgmq.${"q_" + r.name}`,
+        `select count(*)::int as depth from pgmq.${quoteIdent("q_" + r.name)}`,
       );
       out.push({
         name: r.name,
@@ -84,7 +86,11 @@ export function QueuesSection() {
   }, [load]);
 
   async function purge(q: Queue) {
-    const res = await api.sql(`delete from pgmq.${"q_" + q.name}`);
+    if (!VALID_QUEUE.test(q.name)) {
+      toast.error("Invalid queue name");
+      return;
+    }
+    const res = await api.sql(`delete from pgmq.${quoteIdent("q_" + q.name)}`);
     if (!res.ok) {
       toast.error(res.error ?? "Purge failed");
       return;
@@ -213,7 +219,7 @@ function CreateQueueDialog({
 
   async function create() {
     if (!VALID_QUEUE.test(name))
-      return setErr("Lowercase letters, digits and underscores only.");
+      return setErr("Letters, digits, underscores and hyphens only.");
     setBusy(true);
     setErr("");
     const res = await api.sql(`select pgmq.create(${quoteLit(name)})`);

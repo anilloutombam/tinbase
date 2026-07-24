@@ -106,20 +106,27 @@ export function VisualizerSection() {
     load()
   }, [load])
 
+  // Mirror `tables` into a ref so the refresh interval can diff against the
+  // current value without nesting a setPos inside the setTables updater (state
+  // updaters must be pure - the nested call double-ran under StrictMode).
+  const tablesRef = useRef<TableInfo[] | null>(null)
+  useEffect(() => {
+    tablesRef.current = tables
+  }, [tables])
+
   /* live refresh — table list can change under us (DDL from SQL editor) */
   useEffect(() => {
     const t = setInterval(() => {
       api.tables(schema).then((next) => {
-        setTables((cur) => {
-          if (!cur) return cur
-          const changed = JSON.stringify(next.map((x) => [x.name, x.columns.length])) !== JSON.stringify(cur.map((x) => [x.name, x.columns.length]))
-          if (!changed) return cur
-          setPos((p) => {
-            const merged = { ...autoLayout(next), ...p }
-            for (const k of Object.keys(merged)) if (!next.some((x) => x.name === k)) delete merged[k]
-            return merged
-          })
-          return next
+        const cur = tablesRef.current
+        if (!cur) return
+        const changed = JSON.stringify(next.map((x) => [x.name, x.columns.length])) !== JSON.stringify(cur.map((x) => [x.name, x.columns.length]))
+        if (!changed) return
+        setTables(next)
+        setPos((p) => {
+          const merged = { ...autoLayout(next), ...p }
+          for (const k of Object.keys(merged)) if (!next.some((x) => x.name === k)) delete merged[k]
+          return merged
         })
       }, () => {})
     }, 5000)
