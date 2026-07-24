@@ -29,7 +29,15 @@ export async function serveBun(backend: SupaliteBackendShape, opts: ServeOptions
         if (ok) return undefined
         return new Response('upgrade failed', { status: 400 })
       }
-      return backend.fetch(req)
+      // Expose the connecting client's address for rate limiting, stripping any
+      // client-supplied value first so the header can't be forged - the node:http
+      // server does the same from req.socket.remoteAddress. Without this, a
+      // spoofed x-tinbase-remote-addr rotated per request defeats the limiter.
+      const headers = new Headers(req.headers)
+      headers.delete('x-tinbase-remote-addr')
+      const ip = srv.requestIP(req)?.address
+      if (ip) headers.set('x-tinbase-remote-addr', ip)
+      return backend.fetch(new Request(req, { headers }))
     },
     websocket: {
       open(ws: { data: WsData; send(d: string | Uint8Array): void; close(c?: number, r?: string): void }) {
