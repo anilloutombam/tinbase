@@ -292,3 +292,133 @@ describe('row level security', () => {
     await env.supabase.auth.signOut()
   })
 })
+
+describe('csv output', () => {
+  it('returns selected rows as CSV with a header row', async () => {
+    const { data, error } = await env.supabase
+      .from('posts')
+      .select('title,views')
+      .order('id')
+      .csv()
+    expect(error).toBeNull()
+    expect(typeof data).toBe('string')
+    const lines = (data as string).trim().split('\n')
+    expect(lines[0]).toBe('title,views')
+    // shared env accumulates inserts from earlier tests: header + the 4 seeded rows at least
+    expect(lines.length).toBeGreaterThanOrEqual(5)
+    expect(lines[1]).toBe('Analytical Engines,100') // seeded post id=1, ordered first
+  })
+
+  it('quotes cells containing commas or quotes', async () => {
+    const { data: id } = await env.admin
+      .from('posts')
+      .insert({ title: 'Commas, "quotes" and more', author_id: 1 })
+      .select('id')
+      .single()
+    const { data, error } = await env.admin
+      .from('posts')
+      .select('title')
+      .eq('id', (id as { id: number }).id)
+      .csv()
+    expect(error).toBeNull()
+    // comma + embedded quotes → wrapped in quotes with quotes doubled
+    expect((data as string).trim().split('\n')[1]).toBe('"Commas, ""quotes"" and more"')
+    await env.admin.from('posts').delete().eq('id', (id as { id: number }).id)
+  })
+})
+
+describe('aggregates', () => {
+  const TAG = 'agg fixture'
+  beforeAll(async () => {
+    await env.admin.from('posts').insert([
+      { title: TAG, author_id: 1, views: 10 },
+      { title: TAG, author_id: 1, views: 20 },
+      { title: TAG, author_id: 2, views: 5 },
+    ])
+  })
+  afterAll(async () => {
+    await env.admin.from('posts').delete().eq('title', TAG)
+  })
+
+  it('count() returns the row count', async () => {
+    const { data, error } = await env.admin.from('posts').select('count()').eq('title', TAG)
+    expect(error).toBeNull()
+    expect(data).toEqual([{ count: 3 }])
+  })
+
+  it('sum/max over a filtered set', async () => {
+    const { data, error } = await env.admin
+      .from('posts')
+      .select('total:views.sum(), views.max()')
+      .eq('title', TAG)
+    expect(error).toBeNull()
+    const row = (data as Array<{ total: number; max: number }>)[0]
+    expect(Number(row.total)).toBe(35)
+    expect(Number(row.max)).toBe(20)
+  })
+
+  it('groups by a non-aggregate column', async () => {
+    const { data, error } = await env.admin
+      .from('posts')
+      .select('author_id, views.sum()')
+      .eq('title', TAG)
+      .order('author_id')
+    expect(error).toBeNull()
+    const rows = data as Array<{ author_id: number; sum: number }>
+    expect(rows.map((r) => [r.author_id, Number(r.sum)])).toEqual([
+      [1, 30],
+      [2, 5],
+    ])
+  })
+})
+
+describe('explain', () => {
+  it('returns a text plan by default', async () => {
+    const { data, error } = await env.supabase.from('posts').select().explain()
+    expect(error).toBeNull()
+    expect(typeof data).toBe('string')
+    expect(data as unknown as string).toMatch(/cost=/)
+  })
+
+  it('returns a JSON plan with { format: "json" }', async () => {
+    const { data, error } = await env.supabase
+      .from('posts')
+      .select()
+      .eq('published', true)
+      .explain({ format: 'json' })
+    expect(error).toBeNull()
+    expect(Array.isArray(data)).toBe(true)
+    expect((data as unknown as Array<{ Plan: unknown }>)[0]).toHaveProperty('Plan')
+  })
+})
+
+describe('spread embeds', () => {
+  it('to-one spread merges the related row columns', async () => {
+    // author 1's name may have been mutated by earlier tests; compare live
+    const { data: author } = await env.supabase.from('authors').select('name').eq('id', 1).single()
+    const { data, error } = await env.supabase
+      .from('posts')
+      .select('title, ...authors(author_name:name)')
+      .eq('id', 1)
+      .single()
+    expect(error).toBeNull()
+    expect(data).toMatchObject({
+      title: 'Analytical Engines',
+      author_name: (author as { name: string }).name,
+    })
+  })
+
+  it('to-many spread aggregates each column into an array', async () => {
+    const { data, error } = await env.supabase
+      .from('authors')
+      .select('name, ...posts(titles:title)')
+      .eq('id', 2)
+      .single()
+    expect(error).toBeNull()
+    const row = data as { name: string; titles: string[] }
+    expect(row.name).toBe('Linus')
+    expect(Array.isArray(row.titles)).toBe(true)
+    expect(row.titles).toContain('Git Internals')
+    expect(row.titles).toContain('Kernel Design')
+  })
+})

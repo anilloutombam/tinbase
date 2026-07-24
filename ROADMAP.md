@@ -40,16 +40,16 @@ Until the harness exists, coverage numbers below are our own honest estimates.
 
 ## Current state (v0.9.0)
 
-| Module                                       | Coverage                                           | Biggest gaps                                                     |
-| -------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------- |
-| Database (PostgREST)                         | ~85%                                               | aggregates in select, `.explain()`, `.csv()`, full spread embeds |
-| Auth (GoTrue)                                | ~90%                                               | SSO, phone auth                                                  |
-| Storage                                      | ~80%                                               | image transforms, resumable (TUS) uploads                        |
-| Realtime                                     | ~90%                                               | per-row DELETE RLS (WALRUS)                                      |
-| Edge Functions                               | ~85%                                               | remote-import fetch needs network at first run                   |
-| Studio                                       | ~95%                                               | image previews for large files, saved-query sharing              |
-| Type generation                              | ~85%                                               | composite-type args, multi-schema output                         |
-| Extensions (pgvector, pg_cron, pg_net, pgmq) | cron, pg_net, pgmq, webhooks emulated; pgvector 0% | pgvector vector search (needs a bundled binary)                  |
+| Module | Coverage | Biggest gaps |
+| --- | --- | --- |
+| Database (PostgREST) | ~95% | aggregates *within embeds*; error-shape parity (harness) |
+| Auth (GoTrue) | ~90% | SSO, phone auth |
+| Storage | ~90% | image transforms served as no-op (real resize needs a codec) |
+| Realtime | ~90% | per-row DELETE RLS (WALRUS) |
+| Edge Functions | ~85% | remote-import fetch needs network at first run |
+| Studio | ~95% | image previews for large files, saved-query sharing |
+| Type generation | ~85% | composite-type args, multi-schema output |
+| Extensions (pgvector, pg_cron, pg_net, pgmq) | cron, pg_net, pgmq, webhooks emulated; pgvector 0% | pgvector vector search (needs a bundled binary) |
 
 Typical CRUD + auth + storage + realtime app: **~90%** already works.
 
@@ -107,9 +107,16 @@ in the theseus native Postgres binaries or this PGlite build. Two tracks:
 - Target: real Supabase functions run with no edits
 
 ### Phase 6 — Storage & PostgREST fidelity edges
-
-- [ ] Storage image transformations; resumable (TUS) uploads
-- [ ] PostgREST aggregates-in-select, `.explain()`, `.csv()`, spread embeds
+- [x] Storage resumable (TUS) uploads — TUS 1.0.0 creation, creation-with-upload,
+      core PATCH, and termination; upload state held in memory (resumes within a
+      server session), finalized through the normal object-write path
+- [ ] Storage image transformations — interim **no-op**: transform requests
+      (`/render/image/{public,authenticated,sign}/…`) serve the *original* object
+      (with a one-time warning) so apps don't 404. Real resize/re-encode still
+      needs a bundled image codec (a poor fit for the no-deps / browser model)
+- [x] PostgREST aggregates-in-select (`count()`/`sum()`/`avg()`/`max()`/`min()` +
+      implicit group by), `.explain()` (text/json plans), `.csv()`, and to-one /
+      to-many / m2m spread embeds — top-level aggregates only (not yet within embeds)
 - [ ] Error-shape matching verified by the parity harness
 
 ### Phase 7 — Connect to an external Postgres (community request)
@@ -117,19 +124,22 @@ in the theseus native Postgres binaries or this PGlite build. Two tracks:
 Requested on X: _"Would be nice if it could use an external PG instance."_ Point
 tinbase's REST, Auth, Storage, and Realtime at a Postgres you already run
 instead of the embedded PGlite/native engine.
-
-- [ ] A `--database-url postgres://…` (and `createBackend({ databaseUrl })`)
-      engine: a new `DbEngine` adapter over the wire protocol, so nothing above
-      the adapter changes. Reuses the existing native `PgWireClient`.
-- [ ] Treat the target as shared/pre-existing: bootstrap idempotently, keep the
-      `supabase_migrations` conventions, and never assume exclusive ownership or
-      that it starts empty.
+- [x] A `--database-url postgres://…` (and `createBackend({ databaseUrl })`)
+      engine: a `DbEngine` adapter over the wire protocol, so nothing above the
+      adapter changes. Reuses `PgWireClient` + a shared `buildWireEngine`; added
+      cleartext/md5/**SCRAM-SHA-256** auth for TCP. Verified against a real
+      Postgres launched on TCP with SCRAM (no Docker).
+- [x] Treat the target as shared/pre-existing: bootstrap runs idempotently and
+      migrations/seed stay tracked in `supabase_migrations`, so a second boot
+      against the same database neither errors nor re-applies. Never assumes an
+      empty DB or exclusive ownership.
 - [ ] Bonus — a BYO Postgres that already has `pg_cron` / `pg_net` / `pgvector`
       gives you those for real, an alternative to bundling extension binaries
-      (Phase 4).
-- Open questions: the single-writer model vs a real connection (pool?); RLS role
-  switching (needs the target's `anon`/`authenticated` roles, or we create them);
-  realtime CDC without superuser/replication rights on a managed database.
+      (Phase 4). (Largely implied now — migrations using them run as-is.)
+- Deferred follow-ups: **TLS / sslmode** (needed for most managed PGs — Neon,
+  Supabase, RDS); realtime CDC without superuser/replication rights; connection
+  pooling (single-writer today); provisioning the target's `anon`/`authenticated`
+  roles when absent.
 - Boundary: this is "bring your own local/dev Postgres," not managing a remote
   Supabase Cloud project — hosting/pooling/replicas stay [out of scope](#scope-what-we-match-and-what-we-deliberately-dont).
 

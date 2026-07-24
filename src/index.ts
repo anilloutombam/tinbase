@@ -159,7 +159,15 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
   // the server is bound to a network-exposed host.
   assertSecretsSafe({ host: config.host, jwtSecret, vaultKeyDerived, warn: log })
 
-  const db = await Database.create(config.engine ?? config.dataDir, { vaultKey })
+  // Resolve an external-Postgres engine on demand (Node only) so the browser
+  // core never imports the wire client.
+  let engine = config.engine
+  if (!engine && config.databaseUrl) {
+    const { createDatabaseUrlEngine } = await import('./node/native/database-url.js')
+    engine = await createDatabaseUrlEngine({ databaseUrl: config.databaseUrl, log })
+  }
+
+  const db = await Database.create(engine ?? config.dataDir, { vaultKey })
 
   // Anything created after the engine (a running native Postgres child, the
   // realtime LISTEN, background timers) must be torn down if a later step throws
@@ -213,6 +221,7 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
   const storage = new StorageHandler(db, config.storageDriver ?? new MemoryStorageDriver(), {
     jwtSecret,
     defaultFileSizeLimit: config.storageFileSizeLimit,
+    log,
   })
   if (config.buckets?.length) await storage.ensureBuckets(config.buckets)
   const auth = new AuthHandler(db, {
@@ -364,7 +373,12 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     }
 
     // public endpoints that skip apikey checks
-    if (path.startsWith('/storage/v1/object/public/') || path.startsWith('/storage/v1/object/sign/')) {
+    if (
+      path.startsWith('/storage/v1/object/public/') ||
+      path.startsWith('/storage/v1/object/sign/') ||
+      path.startsWith('/storage/v1/render/image/public/') ||
+      path.startsWith('/storage/v1/render/image/sign/')
+    ) {
       if (req.method === 'GET' || req.method === 'HEAD') {
         return withCors(await storage.handle(req, { role: 'anon', claims: null }, url))
       }

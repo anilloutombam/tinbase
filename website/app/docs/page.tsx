@@ -4,6 +4,7 @@ import { Code } from '@/components/code'
 import { WeightChart } from '@/components/weight-chart'
 import { FeatureMatrix } from '@/components/feature-matrix'
 import { ArchitectureDiagram } from '@/components/architecture-diagram'
+import { EngineCards } from '@/components/engine-cards'
 
 const SECTIONS = [
   { id: 'why', label: 'Why tinbase' },
@@ -136,44 +137,20 @@ tinbase db diff    # DDL for out-of-migration schema changes
       --data-dir <path> data dir (default <dir>/.tinbase/db)
       --jwt-secret <s>  JWT secret (or TINBASE_JWT_SECRET)
       --memory          in-memory database (wasm engine)
-      --engine <e>      native (default), wasm, or pgmem`}</Pre>
+      --engine <e>      native (default), wasm, or pgmem
+      --database-url <url>  use an external Postgres you already run
+                            (postgres://…; or DATABASE_URL env)`}</Pre>
 
           <H2 id="engines">Engines</H2>
           <P>
-            <strong className="text-fg">native</strong> (default on macOS/Linux) runs embedded
-            native Postgres 17. The first run downloads platform binaries (~12 MB, cached in{' '}
-            <code className={IC}>~/.cache/tinbase</code>), then <code className={IC}>initdb</code>{' '}
-            with memory-lean settings. ~59 MB of RAM at boot. It listens only on a private unix
-            socket (0700 directory, trust auth) — never TCP. macOS and Linux on x64/arm64.
+            One <code className={IC}>DbEngine</code> interface, four backends. Pick with{' '}
+            <code className={IC}>--engine</code> (or <code className={IC}>--database-url</code>) — nothing above
+            the engine changes.
           </P>
-          <P>
-            <strong className="text-fg">wasm</strong> (the default on Windows) runs PGlite —
-            Postgres compiled to WebAssembly. Zero setup, runs anywhere Node runs including the
-            browser. Its WASM heap sits around ~575–650 MB and does not shrink under load.
-          </P>
-          <P>
-            <strong className="text-fg">pgmem</strong> is an ultralight, pure-JS, in-memory
-            engine via <a className="underline decoration-border underline-offset-2 hover:text-fg" href="https://www.npmjs.com/package/@tinbase/pg-mem">@tinbase/pg-mem</a> —
-            our fork of <a className="underline decoration-border underline-offset-2 hover:text-fg" href="https://github.com/oguimbal/pg-mem">pg-mem</a> —
-            with <strong className="text-fg">no WASM</strong>, the lightest
-            option for the browser (RapidNative local-dev and previews). The fork adds the Postgres
-            surface real projects rely on — <strong className="text-fg">PL/pgSQL, triggers,
-            row-level-security policies, correlated subqueries, <code className={IC}>information_schema</code>{' '}
-            constraints, MERGE, range/full-text types, and declarative partitioning</strong> — so a full
-            Supabase-style bootstrap and real migration sets apply <strong className="text-fg">unchanged,
-            nothing skipped</strong>. It runs the REST CRUD surface, email/password auth,{' '}
-            <strong className="text-fg">edge functions, realtime (broadcast/presence +{' '}
-            <code className={IC}>postgres_changes</code>), and database webhooks</strong>. Caveats vs the
-            Postgres engines: <code className={IC}>LISTEN</code>/<code className={IC}>NOTIFY</code> are no-ops,
-            so realtime/webhook change events are synthesized in JS by the REST layer (every write passes
-            through it in-process); the engine runs with superuser rights, so{' '}
-            <strong className="text-fg">RLS policies are created but not enforced per-request</strong>{' '}
-            (events delivered unfiltered), and <strong className="text-fg">cron</strong> and{' '}
-            <strong className="text-fg">pgmq</strong> are absent. Local-dev / preview only — never production.
-          </P>
-          <P>
-            The wasm and native engines run identical bootstrap, migrations, RLS, and realtime CDC.
-            The full test suite passes on both:{' '}
+          <EngineCards />
+          <P className="mt-6">
+            The <strong className="text-fg">wasm</strong> and <strong className="text-fg">native</strong> engines run
+            identical bootstrap, migrations, RLS, and realtime CDC — the full suite passes on both:{' '}
             <code className={IC}>TINBASE_TEST_ENGINE=native npm test</code>.
           </P>
 
@@ -341,9 +318,9 @@ const supabase = createClient('http://localhost', backend.anonKey, {
               </thead>
               <tbody className="text-muted">
                 {[
-                  ['Database (postgrest-js)', '~85%', 'aggregates in select, .explain(), .csv()'],
+                  ['Database (postgrest-js)', '~95%', 'aggregates within embeds'],
                   ['Auth (auth-js)', '~80%', 'MFA, SSO/SAML, phone auth'],
-                  ['Storage (storage-js)', '~80%', 'resumable uploads, image transforms'],
+                  ['Storage (storage-js)', '~90%', 'image transforms (served as no-op)'],
                   ['Realtime (realtime-js)', '~85%', 'per-row DELETE RLS, private channels'],
                   ['Edge Functions', '~70%', 'npm:/jsr: import resolution, secrets'],
                   ['Type generation', '~85%', 'composite-type args, multi-schema'],

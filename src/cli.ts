@@ -53,6 +53,8 @@ interface CliOptions {
   memory: boolean
   /** database engine: native embedded Postgres, wasm (PGlite), or pgmem (in-memory subset) */
   engine: 'wasm' | 'native' | 'pgmem'
+  /** connect to an external Postgres instead of the embedded engine */
+  databaseUrl?: string
   /** output migration name for `db diff -f`, if given */
   diffFile?: string
 }
@@ -77,6 +79,7 @@ function parseArgs(argv: string[]): CliOptions {
     jwtSecret: process.env.TINBASE_JWT_SECRET ?? DEFAULT_JWT_SECRET,
     memory: false,
     engine: (process.env.TINBASE_ENGINE as 'wasm' | 'native' | 'pgmem') ?? (IS_BINARY || NATIVE_SUPPORTED ? 'native' : 'wasm'),
+    databaseUrl: process.env.TINBASE_DATABASE_URL || process.env.DATABASE_URL || undefined,
   }
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
@@ -87,6 +90,7 @@ function parseArgs(argv: string[]): CliOptions {
     else if (a === '--data-dir') opts.dataDir = resolve(next())
     else if (a === '--storage-dir') opts.storageDir = resolve(next())
     else if (a === '--jwt-secret') opts.jwtSecret = next()
+    else if (a === '--database-url') opts.databaseUrl = next()
     else if (a === '--memory') opts.memory = true
     else if (a === '-f' || a === '--file') opts.diffFile = next()
     else if (a === '--engine') {
@@ -152,6 +156,9 @@ Options:
                         wasm (PGlite - default on Windows, browser-ready), or
                         pgmem (ultralight in-memory subset - no RLS, cron, or
                         pgmq; local dev / preview only)
+      --database-url <url>  connect to an external Postgres you already run
+                        (postgres://user:pass@host:5432/db; or DATABASE_URL env).
+                        Treated as shared: bootstrap runs idempotently.
 `)
 }
 
@@ -308,8 +315,11 @@ async function main(): Promise<void> {
   if (opts.dataDir) await mkdir(opts.dataDir, { recursive: true })
   await mkdir(opts.storageDir, { recursive: true })
 
-  const engine =
-    opts.engine === 'native'
+  // --database-url takes over engine selection: createBackend builds the
+  // external-Postgres engine from the URL.
+  const engine = opts.databaseUrl
+    ? undefined
+    : opts.engine === 'native'
       ? await createNativeEngine({
           dataDir: join(opts.dir, '.tinbase', 'pgdata'),
           log: (msg) => console.log(`  ${msg}`),
@@ -317,6 +327,9 @@ async function main(): Promise<void> {
       : opts.engine === 'pgmem'
         ? await createPgmemEngine()
         : undefined
+  if (opts.databaseUrl) {
+    console.log('  ⚠ using an external Postgres (--database-url): treated as shared — bootstrap runs idempotently.')
+  }
   if (opts.engine === 'pgmem') {
     console.log('  ⚠ pg-mem engine: in-memory subset - no RLS, cron, or pgmq (realtime is unfiltered) - local dev / preview only')
   }
@@ -342,7 +355,8 @@ async function main(): Promise<void> {
 
   const backend = await createBackend({
     engine,
-    dataDir: opts.memory ? undefined : opts.dataDir,
+    databaseUrl: opts.databaseUrl,
+    dataDir: opts.databaseUrl || opts.memory ? undefined : opts.dataDir,
     jwtSecret: opts.jwtSecret,
     // config.toml's site_url is what a real project uses for emailed links and
     // redirects; fall back to the bound address when it's not set. (The server

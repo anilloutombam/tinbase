@@ -11,6 +11,8 @@ export interface SelectColumn {
   name: string
   alias?: string
   cast?: string
+  /** aggregate function applied to the column (col.sum(), count(), ...) */
+  aggregate?: 'avg' | 'count' | 'max' | 'min' | 'sum'
 }
 
 /** An embedded related resource, e.g. `author(name)` or `...profile(bio)`. */
@@ -287,6 +289,21 @@ function parseSelectItem(item: string): SelectItem {
     item = item.slice(aliasIdx + 1)
   }
 
+  // aggregate with empty parens (count(), col.sum(), …) — a column, not an
+  // embed. Cast-suffixed aggregates (col.sum()::text) don't end in ')' and are
+  // handled in the column branch below.
+  if (!spread) {
+    const agg = item.match(/^(?:(.+)\.)?(avg|count|max|min|sum)\(\)$/)
+    if (agg) {
+      return {
+        kind: 'column',
+        name: agg[1] ? unquote(agg[1]) : '',
+        alias,
+        aggregate: agg[2] as SelectColumn['aggregate'],
+      }
+    }
+  }
+
   const parenIdx = item.indexOf('(')
   if (parenIdx !== -1 && item.endsWith(')')) {
     // embed: name[!hint][!inner](children)
@@ -315,7 +332,16 @@ function parseSelectItem(item: string): SelectItem {
     if (!/^[a-zA-Z_][a-zA-Z0-9_ \[\]]*$/.test(cast)) throw new ParseError(`invalid cast: ${cast}`)
     item = item.slice(0, castIdx)
   }
-  return { kind: 'column', name: unquote(item), alias, cast }
+
+  // aggregate: col.sum()/avg()/max()/min()/count(), or a bare count()
+  let aggregate: SelectColumn['aggregate']
+  const aggMatch = item.match(/^(?:(.+)\.)?(avg|count|max|min|sum)\(\)$/)
+  if (aggMatch) {
+    aggregate = aggMatch[2] as SelectColumn['aggregate']
+    item = aggMatch[1] ?? ''
+  }
+
+  return { kind: 'column', name: item === '' ? '' : unquote(item), alias, cast, aggregate }
 }
 
 /** Index of an alias ':' (not '::'), outside quotes/parens; -1 when absent. */

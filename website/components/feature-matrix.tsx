@@ -12,7 +12,7 @@ type Group = { area: string; coverage: string; rows: Row[] }
 const GROUPS: Group[] = [
   {
     area: 'Database · REST (PostgREST)',
-    coverage: '~85%',
+    coverage: '~95%',
     rows: [
       ['Select + filters (eq/neq/gt/lt/like/ilike/in/is, or/and trees)', 'yes', ''],
       ['Embedded resources (to-one, to-many, m2m, nested, !inner, aliases, hints)', 'yes', ''],
@@ -22,9 +22,9 @@ const GROUPS: Group[] = [
       ['Full-text search, JSON-path filters, casts', 'yes', ''],
       ['order / limit / offset (top-level and per-embed)', 'yes', ''],
       ['RPC (scalar, setof, void, filters on results)', 'yes', ''],
-      ['Spread embeds (…rel(col))', 'partial', 'flat column lists only'],
-      ['Aggregates in select (count/sum/avg/…)', 'no', 'planned (Phase 6)'],
-      ['.explain(), .csv()', 'no', 'planned'],
+      ['Spread embeds (…rel(col))', 'yes', 'to-one, to-many, m2m'],
+      ['Aggregates in select (count/sum/avg/…)', 'yes', 'top-level; not yet within embeds'],
+      ['.explain(), .csv()', 'yes', ''],
     ],
   },
   {
@@ -58,14 +58,14 @@ const GROUPS: Group[] = [
   },
   {
     area: 'Storage',
-    coverage: '~80%',
+    coverage: '~90%',
     rows: [
       ['Bucket CRUD, upload (raw + multipart), download', 'yes', ''],
       ['Public objects, signed URLs, signed upload URLs', 'yes', ''],
       ['List with folders, move / copy, remove, size/MIME limits', 'yes', ''],
       ['RLS on storage.objects', 'yes', ''],
-      ['Image transformations (resize/quality)', 'no', 'planned (Phase 6)'],
-      ['Resumable (TUS) uploads', 'no', 'planned'],
+      ['Resumable (TUS) uploads', 'yes', ''],
+      ['Image transformations (resize/quality)', 'partial', 'served as a no-op (original returned); real resize needs a codec'],
     ],
   },
   {
@@ -109,6 +109,7 @@ const GROUPS: Group[] = [
       ['Native embedded Postgres 17 — default (macOS/Linux)', 'yes', ''],
       ['PGlite (WASM Postgres) — browser-ready, default on Windows', 'yes', ''],
       ['pg-mem (pure-JS, in-memory) — @tinbase/pg-mem fork', 'yes', 'runs PL/pgSQL, triggers, RLS DDL; RLS not enforced (superuser); no cron / pgmq'],
+      ['External Postgres (--database-url) — SCRAM/md5 auth', 'partial', 'REST/Auth/Storage; TLS + realtime CDC in progress'],
       ['Single-file binary', 'yes', ''],
       ['Common extensions (uuid-ossp, pgcrypto, citext, pg_trgm, …)', 'yes', 'where the engine bundles them'],
       ['pgvector (vector search)', 'no', 'needs bundled extension binaries (Phase 4)'],

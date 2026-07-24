@@ -30,6 +30,13 @@ export interface BackendConfig {
    * "tinbase/node"). Default: PGlite on `dataDir`.
    */
   engine?: import('./db/engine.js').DbEngine
+  /**
+   * Connect to an external Postgres you already run, e.g.
+   * "postgres://user:pass@host:5432/db", instead of the embedded engine. Node
+   * only; ignored when `engine` is set. The target is treated as shared: the
+   * bootstrap runs idempotently and never assumes exclusive ownership.
+   */
+  databaseUrl?: string
   /** Secret used to sign/verify every JWT. Defaults to the Supabase local-dev secret. */
   jwtSecret?: string
   /**

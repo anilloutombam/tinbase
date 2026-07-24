@@ -5,7 +5,7 @@ import './globals.css'
 const sans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] })
 const mono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] })
 
-const SITE_URL = 'https://tinbase.vercel.app'
+const SITE_URL = 'https://tinbase.dev'
 const TITLE = 'tinbase — the Supabase-compatible backend that fits in a tin'
 const DESCRIPTION =
   'Local Supabase dev without Docker — one process, real Postgres with Row Level Security, Auth, Storage, and Realtime, and it even runs in the browser. The official supabase-js SDK works unchanged.'
