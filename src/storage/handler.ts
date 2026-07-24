@@ -5,11 +5,41 @@
  */
 import type { Database } from '../db/database.js'
 import { signJwt, verifyJwt } from '../jwt.js'
-import type { RequestContext, StorageDriver } from '../types.js'
+import type { BucketSeed, RequestContext, StorageDriver } from '../types.js'
 
+/** Construction options for {@link StorageHandler}. */
 export interface StorageConfig {
+  /** secret used to sign and verify signed download/upload URL tokens */
   jwtSecret: string
+  /** default per-bucket byte limit applied when a bucket sets none (config.toml storage.file_size_limit) */
+  defaultFileSizeLimit?: number
+  /** sink for progress/warning lines (e.g. image-transform no-op); no-op when omitted */
   log?: (message: string) => void
+}
+
+/** Upper bound on signed-URL lifetime (seconds) - 7 days, matching Supabase's practical max. */
+const MAX_SIGNED_URL_EXPIRY = 7 * 24 * 60 * 60
+
+/** Clamp a client-supplied `expiresIn` to a positive value within the allowed maximum. */
+function clampExpiry(expiresIn: number): number {
+  if (!Number.isFinite(expiresIn) || expiresIn <= 0) return 3600
+  return Math.min(Math.floor(expiresIn), MAX_SIGNED_URL_EXPIRY)
+}
+
+/**
+ * Reject object keys that could escape their bucket namespace or diverge between
+ * the metadata row and the on-disk path. Returns an error string, or null when
+ * the key is safe.
+ */
+function invalidObjectKey(key: string): string | null {
+  if (!key) return 'object key is required'
+  if (key.length > 1024) return 'object key too long'
+  if (key.includes('\0')) return 'object key contains a null byte'
+  if (key.startsWith('/') || key.startsWith('\\')) return 'object key must be relative'
+  if (key.includes('\\')) return 'object key must not contain backslashes'
+  const segments = key.split('/')
+  if (segments.some((s) => s === '..' || s === '.')) return 'object key must not contain . or .. segments'
+  return null
 }
 
 interface ObjectRow {
@@ -76,6 +106,7 @@ interface TusUpload {
 
 const TUS_VERSION = '1.0.0'
 
+/** Routes /storage/v1/* requests to bucket and object operations. */
 export class StorageHandler {
   private tusUploads = new Map<string, TusUpload>()
   private warnedTransform = false
@@ -86,6 +117,18 @@ export class StorageHandler {
     private config: StorageConfig
   ) {}
 
+  /** Create the given buckets if they don't already exist (config.toml storage.buckets.*). */
+  async ensureBuckets(buckets: BucketSeed[]): Promise<void> {
+    for (const b of buckets) {
+      await this.db.query(
+        `insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+         values ($1, $1, $2, $3, $4) on conflict (id) do nothing`,
+        [b.id, b.public, b.fileSizeLimit ?? this.config.defaultFileSizeLimit ?? null, b.allowedMimeTypes]
+      )
+    }
+  }
+
+  /** Entry point: match the path to a bucket/object endpoint and map thrown errors to storage-api responses. */
   async handle(req: Request, ctx: RequestContext, url: URL): Promise<Response> {
     const rest = url.pathname.replace(/^\/storage\/v1\/?/, '').replace(/\/+$/, '')
     const method = req.method.toUpperCase()
@@ -278,6 +321,8 @@ export class StorageHandler {
   }
 
   private async upload(req: Request, ctx: RequestContext, bucketId: string, key: string): Promise<Response> {
+    const keyErr = invalidObjectKey(key)
+    if (keyErr) return storageError(400, 'invalid_key', keyErr)
     const bucket = await this.loadBucket(bucketId)
     if (!bucket) return storageError(404, 'Bucket not found', 'Bucket not found')
 
@@ -288,7 +333,7 @@ export class StorageHandler {
 
     if (contentType.startsWith('multipart/form-data')) {
       // storage-js wraps Blob/File bodies in FormData with an EMPTY field
-      // name, which some runtimes' formData() drops — parse bytes ourselves.
+      // name, which some runtimes' formData() drops - parse bytes ourselves.
       const boundary = contentType.match(/boundary="?([^";]+)"?/)?.[1]
       if (!boundary) return storageError(400, 'invalid_request', 'multipart body without boundary')
       const parts = parseMultipart(new Uint8Array(await req.arrayBuffer()), boundary)
@@ -302,7 +347,10 @@ export class StorageHandler {
       bytes = new Uint8Array(await req.arrayBuffer())
     }
 
-    if (bucket.file_size_limit != null && bytes.length > Number(bucket.file_size_limit)) {
+    // Per-bucket limit, falling back to the project-wide default (config.toml
+    // storage.file_size_limit) when the bucket sets none.
+    const sizeLimit = bucket.file_size_limit != null ? Number(bucket.file_size_limit) : this.config.defaultFileSizeLimit
+    if (sizeLimit != null && bytes.length > sizeLimit) {
       return storageError(413, 'Payload too large', 'The object exceeded the maximum allowed size')
     }
     if (bucket.allowed_mime_types && bucket.allowed_mime_types.length > 0) {
@@ -364,8 +412,17 @@ export class StorageHandler {
         [bucketId, key, ctx.claims?.sub ?? null, JSON.stringify(metadata), crypto.randomUUID()]
       )
     )
-    await this.driver.put(`${bucketId}/${key}`, bytes)
-    return (res.rows[0] as { id: string }).id
+    // Row committed first so RLS authorizes the write; if the byte write then
+    // fails, roll the row back so we never leave a metadata row whose download
+    // would 404 ("Object not found").
+    const insertedId = (res.rows[0] as { id: string }).id
+    try {
+      await this.driver.put(`${bucketId}/${key}`, bytes)
+    } catch (e) {
+      await this.db.query(`delete from storage.objects where id = $1`, [insertedId]).catch(() => {})
+      throw e
+    }
+    return insertedId
   }
 
   // ── resumable (TUS) uploads ───────────────────────────────────────────────
@@ -587,21 +644,36 @@ export class StorageHandler {
     if (!body.bucketId || !body.sourceKey || !body.destinationKey) {
       return storageError(400, 'invalid_request', 'bucketId, sourceKey and destinationKey are required')
     }
+    const srcErr = invalidObjectKey(body.sourceKey)
+    if (srcErr) return storageError(400, 'invalid_key', srcErr)
+    const dstErr = invalidObjectKey(body.destinationKey)
+    if (dstErr) return storageError(400, 'invalid_key', dstErr)
     const dstBucket = body.destinationBucket ?? body.bucketId
     const bytes = await this.driver.get(`${body.bucketId}/${body.sourceKey}`)
     if (bytes === null) return storageError(404, 'not_found', 'Object not found')
 
     if (mode === 'move') {
-      const res = await this.db.withContext(ctx, (q) =>
-        q(
-          `update storage.objects set bucket_id = $3, name = $4, updated_at = now()
-           where bucket_id = $1 and name = $2 returning id`,
-          [body.bucketId, body.sourceKey, dstBucket, body.destinationKey]
-        )
-      )
-      if (res.rows.length === 0) return storageError(404, 'not_found', 'Object not found')
+      // Write the destination bytes first so the row never points at a missing
+      // key; if the RLS-checked update fails, remove the bytes we just wrote.
       await this.driver.put(`${dstBucket}/${body.destinationKey}`, bytes)
-      await this.driver.delete(`${body.bucketId}/${body.sourceKey}`)
+      let res
+      try {
+        res = await this.db.withContext(ctx, (q) =>
+          q(
+            `update storage.objects set bucket_id = $3, name = $4, updated_at = now()
+             where bucket_id = $1 and name = $2 returning id`,
+            [body.bucketId, body.sourceKey, dstBucket, body.destinationKey]
+          )
+        )
+      } catch (e) {
+        await this.driver.delete(`${dstBucket}/${body.destinationKey}`).catch(() => {})
+        throw e
+      }
+      if (res.rows.length === 0) {
+        await this.driver.delete(`${dstBucket}/${body.destinationKey}`).catch(() => {})
+        return storageError(404, 'not_found', 'Object not found')
+      }
+      await this.driver.delete(`${body.bucketId}/${body.sourceKey}`).catch(() => {})
       return json(200, { message: 'Successfully moved' })
     }
 
@@ -615,8 +687,14 @@ export class StorageHandler {
       )
     )
     if (res.rows.length === 0) return storageError(404, 'not_found', 'Object not found')
-    await this.driver.put(`${dstBucket}/${body.destinationKey}`, bytes)
-    return json(200, { Id: (res.rows[0] as { id: string }).id, Key: `${dstBucket}/${body.destinationKey}` })
+    const copyId = (res.rows[0] as { id: string }).id
+    try {
+      await this.driver.put(`${dstBucket}/${body.destinationKey}`, bytes)
+    } catch (e) {
+      await this.db.query(`delete from storage.objects where id = $1`, [copyId]).catch(() => {})
+      throw e
+    }
+    return json(200, { Id: copyId, Key: `${dstBucket}/${body.destinationKey}` })
   }
 
   private async listObjects(req: Request, ctx: RequestContext, bucketId: string): Promise<Response> {
@@ -742,6 +820,8 @@ export class StorageHandler {
   }
 
   private async signUploadUrl(ctx: RequestContext, bucketId: string, key: string): Promise<Response> {
+    const keyErr = invalidObjectKey(key)
+    if (keyErr) return storageError(400, 'invalid_key', keyErr)
     const bucket = await this.loadBucket(bucketId)
     if (!bucket) return storageError(404, 'Bucket not found', 'Bucket not found')
     const owner = typeof ctx.claims?.sub === 'string' ? ctx.claims.sub : undefined
@@ -775,7 +855,7 @@ export class StorageHandler {
     owner?: string
   ): Promise<string> {
     const now = Math.floor(Date.now() / 1000)
-    return signJwt({ type, url: `${bucketId}/${key}`, iat: now, exp: now + expiresIn, owner }, this.config.jwtSecret)
+    return signJwt({ type, url: `${bucketId}/${key}`, iat: now, exp: now + clampExpiry(expiresIn), owner }, this.config.jwtSecret)
   }
 }
 

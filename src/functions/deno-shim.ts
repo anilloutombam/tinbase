@@ -10,25 +10,38 @@
  * injected SUPABASE_* vars and declared function secrets (never the host
  * process.env).
  *
- * Not resolved: `npm:` / `jsr:` / URL import specifiers and the Deno std lib —
+ * Not resolved: `npm:` / `jsr:` / URL import specifiers and the Deno std lib -
  * a function using those needs a bundling step. Functions that stick to Web
  * APIs (fetch/Request/Response) + Deno.serve/Deno.env work as-is.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 type DenoHandler = (req: Request) => Response | Promise<Response>
 
 const captured: { handler?: DenoHandler } = {}
-const denoEnv: Record<string, string> = {}
 
-/** Merge variables the shim's Deno.env should expose (SUPABASE_* keys, secrets). */
-export function setDenoEnv(env: Record<string, string>): void {
-  Object.assign(denoEnv, env)
+// The Deno global is installed once per process, but each backend (and each
+// in-flight invocation) has its own function env. An AsyncLocalStorage scopes
+// the env to the invocation's async context, so it stays correct across awaits
+// even when two invocations interleave on the event loop - a module-global that
+// was swapped around `await` would let a later call overwrite an earlier call's
+// env mid-flight. A Deno.env read outside any invocation sees an empty env.
+const envStore = new AsyncLocalStorage<Record<string, string>>()
+
+/**
+ * Run `fn` with the shim's Deno.env bound to `env`. The binding lives in an
+ * async-context store, so concurrent invocations each read their own env and
+ * one backend can never observe another's (or the host's) secrets.
+ */
+export function runWithDenoEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  return envStore.run(env, fn)
 }
 
 /** Install globalThis.Deno if we're not already running under a Deno-like runtime. */
 export function installDenoShim(): void {
   const g = globalThis as Record<string, unknown> & { Deno?: unknown; __tinbaseDeno?: boolean }
   if (g.__tinbaseDeno) return
-  // a real Deno runtime already provides Deno.serve — don't clobber it
+  // a real Deno runtime already provides Deno.serve - don't clobber it
   if (g.Deno && typeof (g.Deno as { serve?: unknown }).serve === 'function') return
   g.__tinbaseDeno = true
   g.Deno = {
@@ -42,15 +55,17 @@ export function installDenoShim(): void {
     // process.env, so a function can't read arbitrary server-side env (cloud
     // credentials, DB URLs, etc.).
     env: {
-      get: (k: string) => denoEnv[k],
+      get: (k: string) => envStore.getStore()?.[k],
       set: (k: string, v: string) => {
-        denoEnv[k] = v
+        const s = envStore.getStore()
+        if (s) s[k] = v
       },
-      has: (k: string) => denoEnv[k] !== undefined,
+      has: (k: string) => envStore.getStore()?.[k] !== undefined,
       delete: (k: string) => {
-        delete denoEnv[k]
+        const s = envStore.getStore()
+        if (s) delete s[k]
       },
-      toObject: () => ({ ...denoEnv }),
+      toObject: () => ({ ...(envStore.getStore() ?? {}) }),
     },
     // enough of the surface that idiomatic functions don't crash on reference
     cwd: () => process.cwd(),
@@ -69,6 +84,7 @@ export function takeCapturedHandler(): DenoHandler | undefined {
   return h
 }
 
+/** Clear any handler captured by Deno.serve(), without returning it. */
 export function resetCapturedHandler(): void {
   captured.handler = undefined
 }

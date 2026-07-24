@@ -1,5 +1,5 @@
 /**
- * Minimal RFC 6455 WebSocket server on top of node:http upgrade events —
+ * Minimal RFC 6455 WebSocket server on top of node:http upgrade events -
  * enough for Phoenix-protocol JSON text frames, so no `ws` dependency.
  */
 import { createHash } from 'node:crypto'
@@ -9,11 +9,29 @@ import type { RealtimeSocketLike } from '../realtime/engine.js'
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
+/** Largest inbound frame payload accepted before the connection is failed (RFC 6455 §7.4.1, 1009). */
+const MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+/** Returned by {@link decodeFrame} when a frame declares a payload larger than {@link MAX_FRAME_BYTES}. */
+export const FRAME_TOO_LARGE = Symbol('frame-too-large')
+
+/** A live socket. Callbacks are assigned by the realtime session after accept. */
 export interface WsConnection extends RealtimeSocketLike {
+  /** invoked per decoded inbound message frame; null until the session wires it up */
   onMessage: ((data: string | Uint8Array) => void) | null
+  /** invoked once when the socket closes; null until the session wires it up */
   onClose: (() => void) | null
 }
 
+/**
+ * Complete the RFC 6455 handshake on an http upgrade and return a connection
+ * that decodes inbound frames and encodes outbound ones. Returns null (and
+ * writes a 400) if the request isn't a valid websocket upgrade.
+ *
+ * `head` is any bytes node already read past the upgrade request; they're
+ * prepended to the frame buffer so a client that pipelines its first frame
+ * isn't dropped.
+ */
 export function acceptWebSocket(req: IncomingMessage, socket: Duplex, head: Buffer): WsConnection | null {
   const key = req.headers['sec-websocket-key']
   if (!key || (req.headers.upgrade ?? '').toLowerCase() !== 'websocket') {
@@ -78,6 +96,10 @@ export function acceptWebSocket(req: IncomingMessage, socket: Duplex, head: Buff
   function processFrames(): void {
     while (true) {
       const frame = decodeFrame(buffer)
+      if (frame === FRAME_TOO_LARGE) {
+        conn.close(1009, 'frame too large')
+        return
+      }
       if (!frame) return
       buffer = buffer.subarray(frame.frameLength)
 
@@ -125,14 +147,25 @@ export function acceptWebSocket(req: IncomingMessage, socket: Duplex, head: Buff
 }
 
 interface Frame {
+  /** FIN bit: true when this frame completes a message (not a fragment continuation) */
   fin: boolean
+  /** RFC 6455 opcode (0x0 continuation, 0x1 text, 0x2 binary, 0x8 close, 0x9 ping, 0xa pong) */
   opcode: number
+  /** whether the payload is masked; every client-to-server frame must be */
   masked: boolean
+  /** the (already unmasked) frame payload bytes */
   payload: Buffer
+  /** total bytes this frame occupies in the buffer (header + payload) */
   frameLength: number
 }
 
-export function decodeFrame(buf: Buffer): Frame | null {
+/**
+ * Decode one frame from the front of `buf`. Returns null when more bytes are
+ * needed (partial frame), {@link FRAME_TOO_LARGE} when the declared 64-bit
+ * length exceeds {@link MAX_FRAME_BYTES}, else the frame with its `frameLength`
+ * so the caller can advance the buffer. Unmasks payloads in place.
+ */
+export function decodeFrame(buf: Buffer): Frame | null | typeof FRAME_TOO_LARGE {
   if (buf.length < 2) return null
   const fin = (buf[0] & 0x80) !== 0
   const opcode = buf[0] & 0x0f
@@ -147,7 +180,7 @@ export function decodeFrame(buf: Buffer): Frame | null {
   } else if (payloadLength === 127) {
     if (buf.length < offset + 8) return null
     const big = buf.readBigUInt64BE(offset)
-    if (big > BigInt(64 * 1024 * 1024)) throw new Error('frame too large')
+    if (big > BigInt(MAX_FRAME_BYTES)) return FRAME_TOO_LARGE
     payloadLength = Number(big)
     offset += 8
   }

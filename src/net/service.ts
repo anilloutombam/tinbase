@@ -1,5 +1,5 @@
 /**
- * In-process HTTP sender for the pg_net emulation — the execution half of the
+ * In-process HTTP sender for the pg_net emulation - the execution half of the
  * net.* surface (the net.http_get/post/delete SQL functions live in
  * db/emulated.ts). It drains net.http_request_queue, performs each request with
  * fetch, and records the reply in net._http_response, mirroring pg_net's
@@ -10,11 +10,17 @@ import type { Database } from '../db/database.js'
 /** Cap on the response body we buffer into net._http_response (bytes). */
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
+/** Max redirect hops guardedFetch will follow, re-validating each target. */
+const MAX_REDIRECTS = 5
+
 /**
- * Reject requests to non-public destinations. This is a literal-host guard
- * (loopback / private / link-local / cloud-metadata), which blocks the common
- * SSRF vectors without an async DNS lookup. Returns an error string, or null
- * when the URL is allowed.
+ * Reject requests to non-public destinations. A synchronous literal-host guard
+ * (loopback / private / link-local / cloud-metadata) that also rejects
+ * alternate numeric IP encodings which would slip past the literal checks but
+ * still connect to a real address. No DNS lookup - a public hostname that
+ * *resolves* to private space (DNS rebinding) is a residual this doesn't cover;
+ * doing so would add a per-request lookup that can hang for 30s on an
+ * unresolvable host. Returns an error string, or null when the URL is allowed.
  */
 export function blockedNetTarget(rawUrl: string): string | null {
   let u: URL
@@ -27,6 +33,13 @@ export function blockedNetTarget(rawUrl: string): string | null {
   const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '')
   if (host === 'localhost' || host.endsWith('.localhost')) return 'blocked host: localhost'
   if (isPrivateIp(host)) return `blocked host: ${host}`
+  // Reject alternate numeric encodings of an IP that pass the literal checks but
+  // still reach a real address - http://2130706433 and http://0x7f000001 both
+  // connect to 127.0.0.1. A genuine DNS name contains a letter and is not
+  // 0x-prefixed; dotted-IPv4 and IPv6 literals were already checked above.
+  if (!host.includes(':') && !/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && (host.startsWith('0x') || !/[a-z]/i.test(host))) {
+    return `blocked host: ${host} (non-DNS address encoding)`
+  }
   return null
 }
 
@@ -49,6 +62,26 @@ function isPrivateIp(host: string): boolean {
   return false
 }
 
+/**
+ * fetch with an SSRF guard that re-validates every redirect hop. Default fetch
+ * follows redirects without re-checking, so a public URL could 3xx into private
+ * space; this follows manually (capped at {@link MAX_REDIRECTS}) and runs
+ * {@link blockedNetTarget} on each target. Throws with the block reason on a
+ * rejected hop.
+ */
+export async function guardedFetch(fetchImpl: typeof fetch, url: string, init: RequestInit = {}): Promise<Response> {
+  let current = url
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const blocked = blockedNetTarget(current)
+    if (blocked) throw new Error(blocked)
+    const res = await fetchImpl(current, { ...init, redirect: 'manual' })
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null
+    if (!location) return res
+    current = new URL(location, current).toString()
+  }
+  throw new Error(`too many redirects (>${MAX_REDIRECTS})`)
+}
+
 interface RequestRow {
   id: number
   method: string
@@ -58,18 +91,30 @@ interface RequestRow {
   timeout_milliseconds: number
 }
 
+/** Outcome of one drained request, passed to the optional `onDeliver` callback. */
 export interface NetDelivery {
+  /** net.http_request_queue row id */
   id: number
   method: string
   url: string
+  /** response status; undefined when the request failed before a reply */
   status?: number
+  /** true if the request aborted on its timeout */
   timedOut: boolean
+  /** failure reason (network error, blocked target, etc.); undefined on success */
   error?: string
 }
 
+/**
+ * Drains net.http_request_queue on an interval, performs each request, and
+ * records the reply in net._http_response - the pg_net background worker,
+ * in-process.
+ */
 export class NetService {
   private timer: ReturnType<typeof setInterval> | null = null
   private draining = false
+  /** The in-flight tick, tracked so stop() can drain it before db.close(). */
+  private inFlight: Promise<void> | null = null
 
   constructor(
     private db: Database,
@@ -79,20 +124,30 @@ export class NetService {
     private onDeliver?: (d: NetDelivery) => void
   ) {}
 
+  /** Begin draining the queue on the tick interval; no-op if already running. */
   start(): void {
     if (this.timer) return
-    this.timer = setInterval(() => void this.tick(), this.tickMs)
+    this.timer = setInterval(() => {
+      this.inFlight = this.tick()
+    }, this.tickMs)
     if (typeof this.timer === 'object' && 'unref' in this.timer) (this.timer as { unref: () => void }).unref()
   }
 
-  stop(): void {
+  /**
+   * Stop the drain loop and wait for any in-flight tick to finish before the
+   * caller closes the database - the single connection busy-loops if closed
+   * while a query is still queued.
+   */
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    await this.inFlight?.catch(() => {})
+    this.inFlight = null
   }
 
   /** Drain any queued requests once (also callable directly in tests). */
   async tick(): Promise<void> {
-    if (this.draining) return // never overlap drains — one writer at a time
+    if (this.draining) return // never overlap drains - one writer at a time
     this.draining = true
     try {
       let rows: RequestRow[]
@@ -105,7 +160,17 @@ export class NetService {
       } catch {
         return // net.* not present (e.g. the pg-mem subset engine)
       }
-      for (const row of rows) await this.deliver(row)
+      for (const row of rows) {
+        try {
+          await this.deliver(row)
+        } catch (e) {
+          // A malformed row must never poison the loop or reject out of the
+          // setInterval callback - dequeue it with the error recorded instead.
+          const msg = e instanceof Error ? e.message : String(e)
+          await this.record(row.id, null, null, null, null, false, msg)
+          this.onDeliver?.({ id: row.id, method: row.method, url: row.url, timedOut: false, error: msg })
+        }
+      }
     } finally {
       this.draining = false
     }
@@ -124,17 +189,11 @@ export class NetService {
     let timedOut = false
     let errorMsg: string | null = null
 
-    const blocked = blockedNetTarget(row.url)
-    if (blocked) {
-      clearTimeout(timer)
-      await this.record(row.id, null, null, null, content, false, blocked)
-      this.onDeliver?.({ id: row.id, method: row.method, url: row.url, timedOut: false, error: blocked })
-      return
-    }
-
     try {
       const hasBody = row.method !== 'GET' && row.method !== 'HEAD'
-      const res = await this.fetchImpl(row.url, {
+      // guardedFetch enforces the SSRF policy on the initial URL and every
+      // redirect hop (a plain fetch would follow a 3xx into private space).
+      const res = await guardedFetch(this.fetchImpl, row.url, {
         method: row.method,
         headers,
         body: hasBody ? row.body ?? undefined : undefined,

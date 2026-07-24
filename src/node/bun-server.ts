@@ -1,6 +1,6 @@
 /**
  * Bun-native server: Bun.serve with first-class WebSockets. Used automatically
- * when the CLI runs under Bun (including single-binary builds) — same backend,
+ * when the CLI runs under Bun (including single-binary builds) - same backend,
  * same RealtimeSocketLike contract as the node:http path.
  */
 import type { SupaliteBackendShape } from './server-shared.js'
@@ -8,11 +8,14 @@ import type { RunningServer, ServeOptions } from './server.js'
 
 declare const Bun: any
 
+/** Per-connection state Bun carries through the websocket lifecycle callbacks. */
 interface WsData {
   vsn: string
+  /** Realtime session, created on `open` and driven by `message`/`close`. */
   session?: { onMessage: (data: string | Uint8Array) => void; onClose: () => void }
 }
 
+/** Bun equivalent of {@link import('./server.js').serve}; same backend contract. */
 export async function serveBun(backend: SupaliteBackendShape, opts: ServeOptions = {}): Promise<RunningServer> {
   const host = opts.host ?? '127.0.0.1'
 
@@ -26,7 +29,15 @@ export async function serveBun(backend: SupaliteBackendShape, opts: ServeOptions
         if (ok) return undefined
         return new Response('upgrade failed', { status: 400 })
       }
-      return backend.fetch(req)
+      // Expose the connecting client's address for rate limiting, stripping any
+      // client-supplied value first so the header can't be forged - the node:http
+      // server does the same from req.socket.remoteAddress. Without this, a
+      // spoofed x-tinbase-remote-addr rotated per request defeats the limiter.
+      const headers = new Headers(req.headers)
+      headers.delete('x-tinbase-remote-addr')
+      const ip = srv.requestIP(req)?.address
+      if (ip) headers.set('x-tinbase-remote-addr', ip)
+      return backend.fetch(new Request(req, { headers }))
     },
     websocket: {
       open(ws: { data: WsData; send(d: string | Uint8Array): void; close(c?: number, r?: string): void }) {

@@ -1,5 +1,6 @@
 import { writeFileSync, mkdtempSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -25,6 +26,10 @@ create table posts (
 );
 
 create function add_two(a int, b int) returns int language sql as $$ select a + b $$;
+
+-- interval/point start with "int"/"po" but must map to string, not number
+create function shift_window(win interval, origin point) returns int
+  language sql as $$ select 1 $$;
 `
 
 let backend: TinbaseBackend
@@ -73,6 +78,12 @@ describe('gen types', () => {
     expect(output).toContain('Returns: number')
   })
 
+  it('maps interval/point args to string, not number', () => {
+    const block = output.slice(output.indexOf('shift_window: {'))
+    expect(block).toMatch(/win: string/)
+    expect(block).toMatch(/origin: string/)
+  })
+
   it('output is valid TypeScript and types a supabase-js client', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tb-types-'))
     writeFileSync(join(dir, 'db.ts'), output)
@@ -90,7 +101,9 @@ void p; void mood
       join(dir, 'tsconfig.json'),
       JSON.stringify({ compilerOptions: { strict: true, noEmit: true, skipLibCheck: true, moduleResolution: 'bundler', module: 'esnext', target: 'es2022' } })
     )
-    // tsc exits 0 only if the generated .d types check
-    execFileSync('npx', ['tsc', '-p', join(dir, 'tsconfig.json')], { stdio: 'pipe' })
+    // tsc exits 0 only if the generated .d types check. Run the local compiler
+    // through node directly — spawning the `npx` .cmd shim fails on Windows.
+    const tsc = createRequire(import.meta.url).resolve('typescript/lib/tsc.js')
+    execFileSync(process.execPath, [tsc, '-p', join(dir, 'tsconfig.json')], { stdio: 'pipe' })
   })
 })

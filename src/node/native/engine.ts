@@ -1,12 +1,12 @@
 /**
- * Native embedded Postgres engine — PocketBase-class footprint with real
+ * Native embedded Postgres engine - PocketBase-class footprint with real
  * Postgres semantics. Downloads platform binaries once (~12 MB from
  * theseus-rs/postgresql-binaries), runs initdb with memory-lean settings,
  * and manages the postgres child process. Trust auth over a private unix
  * socket directory (0700), never TCP.
  */
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -17,6 +17,7 @@ import { buildWireEngine } from './wire-engine.js'
 
 const DEFAULT_PG_VERSION = '17.7.0'
 
+/** Options for {@link createNativeEngine}. */
 export interface NativeEngineOptions {
   /** Postgres data directory (created + initdb'd if missing). */
   dataDir: string
@@ -24,6 +25,7 @@ export interface NativeEngineOptions {
   version?: string
   /** Where downloaded binaries are cached. Default ~/.cache/tinbase */
   cacheDir?: string
+  /** sink for progress lines (download, install); no-op when omitted */
   log?: (msg: string) => void
 }
 
@@ -40,6 +42,42 @@ function isCompleteInstall(dir: string): boolean {
   return existsSync(join(dir, 'bin', 'postgres')) && existsSync(join(dir, 'share', 'postgres.bki'))
 }
 
+/**
+ * Pinned SHA-256 digests for the tarballs we download, keyed by
+ * `postgresql-<version>-<target>`. A pinned entry is enforced offline (strongest
+ * integrity). For versions/targets not listed here we fall back to the checksum
+ * the release publishes alongside the tarball, which still defends against
+ * truncated downloads and mismatched redirects.
+ */
+const PINNED_SHA256: Record<string, string> = {
+  // theseus-rs/postgresql-binaries 17.7.0 (the DEFAULT_PG_VERSION). Refresh
+  // these from the release *.sha256 files whenever DEFAULT_PG_VERSION changes.
+  'postgresql-17.7.0-x86_64-unknown-linux-gnu': '66ad03281a43624f955c8e16ac975cb0ab751e7edf8ba35308e3b08dd7d065c3',
+  'postgresql-17.7.0-aarch64-unknown-linux-gnu': '89cc2f089880cc8e5e6b7a29387829ec4e4779427855bc0b9fa187c8fce33c8b',
+  'postgresql-17.7.0-x86_64-apple-darwin': '0dd8c25173524bad4ae8ef6b970da1ac40f4c1f231150c416ccb8cd06feff8f2',
+  'postgresql-17.7.0-aarch64-apple-darwin': '727ac08d20a704014a0d51eb3300aa0c8e292c1cf0a1c99d4f4b1002e1420220',
+}
+
+/** Verify `tarball` against a pinned digest, else the release's published .sha256. */
+async function verifyTarball(tarball: string, key: string, url: string): Promise<void> {
+  const actual = createHash('sha256').update(readFileSync(tarball)).digest('hex')
+  const pinned = PINNED_SHA256[key]
+  if (pinned) {
+    if (actual !== pinned) {
+      throw new Error(`postgres binary checksum mismatch for ${key}: expected ${pinned}, got ${actual}`)
+    }
+    return
+  }
+  // No local pin - verify against the checksum the release publishes.
+  const res = await fetch(`${url}.sha256`)
+  if (!res.ok) throw new Error(`could not fetch checksum for ${key}: HTTP ${res.status}`)
+  const expected = (await res.text()).trim().split(/\s+/)[0].toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(expected)) throw new Error(`malformed published checksum for ${key}`)
+  if (actual !== expected) {
+    throw new Error(`postgres binary checksum mismatch for ${key}: expected ${expected}, got ${actual}`)
+  }
+}
+
 /** Download + unpack Postgres binaries if not already cached (concurrency-safe). Returns the install dir. */
 export async function ensurePostgres(version = DEFAULT_PG_VERSION, cacheDir?: string, log?: (m: string) => void): Promise<string> {
   const t = target()
@@ -49,7 +87,7 @@ export async function ensurePostgres(version = DEFAULT_PG_VERSION, cacheDir?: st
 
   // Concurrency-safe: multiple test workers / processes may call this at once on
   // a cold cache. Each downloads + extracts to unique temp paths, then atomically
-  // renames into place — so no worker ever sees a half-written tarball or a
+  // renames into place - so no worker ever sees a half-written tarball or a
   // partially-extracted install dir.
   const url = `https://github.com/theseus-rs/postgresql-binaries/releases/download/${version}/postgresql-${version}-${t}.tar.gz`
   mkdirSync(root, { recursive: true })
@@ -63,6 +101,8 @@ export async function ensurePostgres(version = DEFAULT_PG_VERSION, cacheDir?: st
     const res = await fetch(url)
     if (!res.ok) throw new Error(`failed to download ${url}: HTTP ${res.status}`)
     await writeFile(tarball, Buffer.from(await res.arrayBuffer()))
+    // Integrity-check the tarball before executing anything it contains.
+    await verifyTarball(tarball, `postgresql-${version}-${t}`, url)
     mkdirSync(tmpDir, { recursive: true })
     execFileSync('tar', ['xzf', tarball, '-C', tmpDir, '--strip-components=1'])
     if (!isCompleteInstall(tmpDir)) throw new Error('postgres archive extracted incompletely')
@@ -96,6 +136,11 @@ synchronous_commit = off
 logging_collector = off
 `
 
+/**
+ * Boot the embedded Postgres child (initdb on first run) and return a {@link DbEngine}
+ * backed by two wire connections: one for queries/transactions (serialized by a mutex),
+ * one dedicated to LISTEN/NOTIFY.
+ */
 export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbEngine> {
   const installDir = await ensurePostgres(opts.version, opts.cacheDir, opts.log)
   const bin = (name: string) => join(installDir, 'bin', name)
@@ -118,7 +163,7 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
   // Remove it if the process it names is no longer alive.
   removeStalePidFile(join(opts.dataDir, 'postmaster.pid'))
 
-  // private socket dir — trust auth is safe because only this user can reach it.
+  // private socket dir - trust auth is safe because only this user can reach it.
   // Keep the path short: macOS caps unix socket paths at ~104 chars.
   const sockDir = mkdtempSync(join(tmpdir(), 'tb-'))
   chmodSync(sockDir, 0o700)
@@ -133,6 +178,14 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
     stderr = (stderr + d.toString()).slice(-4000)
   })
   child.on('exit', () => (childExited = true))
+
+  // Best-effort: if this Node process exits without a clean close() (crash,
+  // uncaught signal), take the postgres child down with it so it doesn't
+  // orphan and hold the data dir. Removed in close().
+  const killChild = (): void => {
+    if (!childExited) child.kill('SIGTERM')
+  }
+  process.once('exit', killChild)
 
   const socketPath = join(sockDir, '.s.PGSQL.5432')
   const connect = async (): Promise<PgWireClient> => {
@@ -179,7 +232,7 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
 /**
  * Postgres refuses to boot if a postmaster.pid names a live process. When the
  * previous run crashed the pid is stale; postgres usually clears it, but if the
- * data dir moved or the boot ID differs it may not — remove it when the named
+ * data dir moved or the boot ID differs it may not - remove it when the named
  * pid is dead so a fresh start succeeds.
  */
 function removeStalePidFile(pidPath: string): void {
@@ -192,12 +245,12 @@ function removeStalePidFile(pidPath: string): void {
     }
     try {
       process.kill(pid, 0) // throws if the process does not exist
-      // process is alive — leave the pid file; postgres will report the conflict
+      // process is alive - leave the pid file; postgres will report the conflict
     } catch {
       rmSync(pidPath, { force: true })
     }
   } catch {
-    // unreadable pid file — let postgres decide
+    // unreadable pid file - let postgres decide
   }
 }
 

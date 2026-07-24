@@ -1,23 +1,56 @@
 /**
- * GoTrue-compatible auth endpoints (/auth/v1/*) — the subset supabase-js
+ * GoTrue-compatible auth endpoints (/auth/v1/*) - the subset supabase-js
  * uses for email/password auth, sessions, and admin user management.
  */
 import type { Database } from '../db/database.js'
 import { randomToken, signJwt, verifyJwt, type JwtClaims } from '../jwt.js'
-import type { Mailer, RequestContext } from '../types.js'
+import { TINBASE_VERSION, type Mailer, type RequestContext } from '../types.js'
 import { OAuthService, type OAuthProviderConfig } from './oauth.js'
 import { hashPassword, verifyPassword } from './password.js'
 import { qrSvgDataUri } from './qr.js'
+import { DEFAULT_AUTH_SETTINGS, type AuthSettings } from './settings.js'
+import { resolveRedirect } from './redirect.js'
+import { RateLimiter } from './rate-limit.js'
 import { generateTotpSecret, otpauthUri, verifyTotp } from './totp.js'
 
+/** Construction-time config for {@link AuthHandler}. */
 export interface AuthConfig {
+  /** HS256 secret used to sign and verify access tokens */
   jwtSecret: string
+  /** public base URL of this instance; used as issuer and default redirect target */
   siteUrl: string
+  /** Access-token lifetime in seconds. */
   jwtExpiry: number
+  /** Force sign-out after this many seconds (config.toml auth.sessions.timebox). Caps session lifetime. */
+  sessionTimeboxSeconds?: number
+  /** sends outgoing auth email (magic links, OTP codes, recovery) */
   mailer: Mailer
+  /** OAuth providers to enable, keyed by provider name (google, github, …) */
   oauthProviders?: Record<string, OAuthProviderConfig>
   /** injectable fetch for the OAuth provider calls (tests use a mock provider) */
   oauthFetch?: typeof fetch
+  /**
+   * Additional redirect targets allowed beyond the site URL's own origin
+   * (GoTrue's URI_ALLOW_LIST). Entries may use `*`/`**` globs. A `redirect_to`
+   * that matches neither the site origin nor an entry falls back to the site URL.
+   */
+  uriAllowList?: string[]
+  /**
+   * Enforce the redirect allowlist strictly. Off for local dev (any well-formed
+   * URL is honored, like `supabase start`); the backend turns it on when
+   * network-exposed so redirects can't leave the allowed origins.
+   */
+  enforceRedirectAllowList?: boolean
+  /**
+   * Runtime-mutable toggles (signups, anonymous users, autoconfirm…). The
+   * admin API mutates this same object in place, so changes apply instantly.
+   */
+  settings?: AuthSettings
+  /**
+   * Rate limiter for login/signup/OTP/recovery. Defaults to a fresh in-memory
+   * limiter with GoTrue-shaped windows; pass `null` to disable (e.g. tests).
+   */
+  rateLimiter?: RateLimiter | null
 }
 
 interface UserRow {
@@ -41,6 +74,16 @@ function authError(status: number, errorCode: string, msg: string): Response {
   return json(status, { code: status, error_code: errorCode, msg })
 }
 
+/** A cryptographically-random numeric OTP of `length` digits (6-10). */
+function randomOtp(length: number): string {
+  const n = Math.max(6, Math.min(10, Math.floor(length)))
+  const buf = new Uint32Array(n)
+  crypto.getRandomValues(buf)
+  let code = ''
+  for (let i = 0; i < n; i++) code += String(buf[i] % 10)
+  return code
+}
+
 function json(status: number, body: unknown): Response {
   return new Response(status === 204 ? null : JSON.stringify(body), {
     status,
@@ -53,38 +96,80 @@ function iso(v: Date | string | null): string | null {
   return v instanceof Date ? v.toISOString() : new Date(v).toISOString()
 }
 
+/** Routes and services the GoTrue-compatible `/auth/v1/*` endpoints. */
 export class AuthHandler {
   private oauth: OAuthService
+  /** Shared, runtime-mutable settings - read on every request, never copied. */
+  private settings: AuthSettings
+  private rateLimiter: RateLimiter | null
 
   constructor(
     private db: Database,
     private config: AuthConfig
   ) {
-    this.oauth = new OAuthService(db, config.siteUrl, config.oauthProviders ?? {}, config.oauthFetch ?? fetch)
+    this.oauth = new OAuthService(
+      db,
+      config.siteUrl,
+      config.oauthProviders ?? {},
+      config.oauthFetch ?? fetch,
+      config.uriAllowList,
+      config.enforceRedirectAllowList
+    )
+    this.settings = config.settings ?? { ...DEFAULT_AUTH_SETTINGS }
+    this.rateLimiter = config.rateLimiter === undefined ? new RateLimiter() : config.rateLimiter
   }
 
+  /**
+   * Enforce the rate limit for `action`, keyed by client address. Returns a 429
+   * (GoTrue's `over_request_rate_limit`) when exceeded, else null to proceed.
+   */
+  private limit(action: string, req: Request): Response | null {
+    if (!this.rateLimiter) return null
+    const client = req.headers.get('x-tinbase-remote-addr') ?? 'local'
+    const retryAfter = this.rateLimiter.check(action, client)
+    if (retryAfter === null) return null
+    return new Response(
+      JSON.stringify({ code: 429, error_code: 'over_request_rate_limit', msg: 'Request rate limit reached' }),
+      { status: 429, headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': String(retryAfter) } }
+    )
+  }
+
+  /** Stop background timers (rate-limiter sweep). Called on backend close. */
+  stop(): void {
+    this.rateLimiter?.stop()
+  }
+
+  /** Dispatch one `/auth/v1/*` request. Any thrown error becomes a 500 `unexpected_failure`. */
   async handle(req: Request, ctx: RequestContext, url: URL): Promise<Response> {
     const path = url.pathname.replace(/^\/auth\/v1\/?/, '').replace(/\/+$/, '')
     const method = req.method.toUpperCase()
 
     try {
-      if (path === 'health') return json(200, { name: 'tinbase-auth', version: '0.1.0', description: 'GoTrue-compatible auth' })
+      if (path === 'health') return json(200, { name: 'tinbase-auth', version: TINBASE_VERSION, description: 'GoTrue-compatible auth' })
       if (path === 'settings') {
+        const providers = Object.keys(this.config.oauthProviders ?? {})
         return json(200, {
-          external: { email: true, phone: false, anonymous_users: true },
-          disable_signup: false,
-          autoconfirm: true,
-          mailer_autoconfirm: true,
+          external: {
+            email: true,
+            phone: false,
+            anonymous_users: this.settings.anonymousUsers,
+            ...Object.fromEntries(providers.map((p) => [p, !this.settings.disabledProviders.includes(p)])),
+          },
+          disable_signup: this.settings.disableSignup,
+          autoconfirm: this.settings.autoconfirm,
+          mailer_autoconfirm: this.settings.autoconfirm,
+          minimum_password_length: this.settings.minPasswordLength,
         })
       }
-      if (path === 'signup' && method === 'POST') return await this.signup(req)
-      if (path === 'token' && method === 'POST') return await this.token(req, url)
+      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req))
+      if (path === 'token' && method === 'POST') return this.limit('token', req) ?? (await this.token(req, url))
       if (path === 'user' && method === 'GET') return await this.getUser(req)
       if (path === 'user' && method === 'PUT') return await this.updateUser(req)
       if (path === 'logout' && method === 'POST') return await this.logout(req)
-      if (path === 'otp' && method === 'POST') return await this.sendOtp(req)
-      if (path === 'recover' && method === 'POST') return await this.sendRecovery(req)
-      if (['magiclink', 'resend'].includes(path) && method === 'POST') return await this.sendOtp(req)
+      if (path === 'otp' && method === 'POST') return this.limit('otp', req) ?? (await this.sendOtp(req))
+      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req))
+      if (['magiclink', 'resend'].includes(path) && method === 'POST')
+        return this.limit('otp', req) ?? (await this.sendOtp(req))
       if (path === 'verify' && method === 'POST') return await this.verifyToken(req)
       if (path === 'verify' && method === 'GET') return await this.verifyLink(url)
       if (path === 'factors' && method === 'POST') return await this.enrollFactor(req)
@@ -94,7 +179,13 @@ export class AuthHandler {
         return await this.verifyFactor(req, path.split('/')[1])
       if (/^factors\/[^/]+$/.test(path) && method === 'DELETE')
         return await this.unenrollFactor(req, path.split('/')[1])
-      if (path === 'authorize' && method === 'GET') return await this.oauth.authorize(url)
+      if (path === 'authorize' && method === 'GET') {
+        const provider = url.searchParams.get('provider') ?? ''
+        if (provider && this.settings.disabledProviders.includes(provider)) {
+          return authError(422, 'provider_disabled', `Sign-ins with ${provider} are disabled`)
+        }
+        return await this.oauth.authorize(url)
+      }
       if (path === 'callback' && (method === 'GET' || method === 'POST')) {
         return await this.oauth.callback(url, (userId) => this.sessionTokensFor(userId))
       }
@@ -117,6 +208,9 @@ export class AuthHandler {
 
     if (!body.email && !body.password) {
       // supabase.auth.signInAnonymously()
+      if (!this.settings.anonymousUsers) {
+        return authError(422, 'anonymous_provider_disabled', 'Anonymous sign-ins are disabled')
+      }
       const res = await this.db.query(
         `insert into auth.users (aud, role, raw_app_meta_data, raw_user_meta_data, is_anonymous, last_sign_in_at)
          values ('authenticated', 'authenticated', '{}', $1, true, now())
@@ -126,11 +220,14 @@ export class AuthHandler {
       return json(200, await this.sessionFor(res.rows[0] as UserRow))
     }
 
+    if (this.settings.disableSignup) {
+      return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
+    }
     if (!body.email || !body.password) {
       return authError(400, 'validation_failed', 'Signup requires a valid email and password')
     }
-    if (body.password.length < 6) {
-      return authError(422, 'weak_password', 'Password should be at least 6 characters.')
+    if (body.password.length < this.settings.minPasswordLength) {
+      return authError(422, 'weak_password', `Password should be at least ${this.settings.minPasswordLength} characters.`)
     }
     const email = body.email.toLowerCase().trim()
     const existing = await this.db.query(`select id from auth.users where email = $1`, [email])
@@ -138,17 +235,32 @@ export class AuthHandler {
       return authError(422, 'user_already_exists', 'User already registered')
     }
     const hashed = await hashPassword(body.password)
+    const autoconfirm = this.settings.autoconfirm
     const res = await this.db.query(
       `insert into auth.users
          (aud, role, email, encrypted_password, email_confirmed_at, last_sign_in_at,
           raw_app_meta_data, raw_user_meta_data)
-       values ('authenticated', 'authenticated', $1, $2, now(), now(),
+       values ('authenticated', 'authenticated', $1, $2, case when $4 then now() else null end, now(),
                '{"provider":"email","providers":["email"]}', $3)
        returning *`,
-      [email, hashed, JSON.stringify(body.data ?? {})]
+      [email, hashed, JSON.stringify(body.data ?? {}), autoconfirm]
     )
     const newUser = res.rows[0] as UserRow
+    // GoTrue records an `email` identity at signup, so user.identities reflects
+    // the email provider (getUser returned [] before this). Mirrors the shape
+    // written on anonymous-to-email upgrade.
+    await this.db.query(
+      `insert into auth.identities (user_id, provider, provider_id, identity_data)
+       values ($1, 'email', $2, $3)
+       on conflict (provider, provider_id) do nothing`,
+      [newUser.id, newUser.id, JSON.stringify({ sub: newUser.id, email: newUser.email })]
+    )
     await this.audit('user_signedup', { actorId: newUser.id, actorEmail: email })
+    if (!autoconfirm) {
+      // confirmation required: email a verification link/code; no session yet
+      await this.issueToken(email, 'otp', false, 'confirm')
+      return json(200, this.userJson(newUser))
+    }
     return json(200, await this.sessionFor(newUser))
   }
 
@@ -163,6 +275,10 @@ export class AuthHandler {
       if (!user || !user.encrypted_password || !(await verifyPassword(body.password ?? '', user.encrypted_password))) {
         await this.audit('login_failed', { actorEmail: email, traits: { grant_type: 'password' } })
         return authError(400, 'invalid_credentials', 'Invalid login credentials')
+      }
+      // when confirmation is required, unverified accounts cannot sign in yet
+      if (!this.settings.autoconfirm && !user.email_confirmed_at) {
+        return authError(400, 'email_not_confirmed', 'Email not confirmed')
       }
       await this.db.query(`update auth.users set last_sign_in_at = now() where id = $1`, [user.id])
       await this.audit('login', { actorId: user.id, actorEmail: user.email, traits: { grant_type: 'password' } })
@@ -203,7 +319,7 @@ export class AuthHandler {
   private async getUser(req: Request): Promise<Response> {
     const user = await this.userFromBearer(req)
     if (!user) return authError(401, 'no_authorization', 'Invalid or expired token')
-    return json(200, this.userJson(user, await this.getUserFactors(user.id)))
+    return json(200, this.userJson(user, await this.getUserFactors(user.id), await this.getUserIdentities(user.id)))
   }
 
   private async updateUser(req: Request): Promise<Response> {
@@ -218,7 +334,7 @@ export class AuthHandler {
     const params: unknown[] = []
     // Upgrading an anonymous user to a permanent one: adding an email (and
     // usually a password) keeps the same id + data, flips is_anonymous off, and
-    // records an email identity — matching supabase.auth.updateUser({ email }).
+    // records an email identity - matching supabase.auth.updateUser({ email }).
     const upgradingAnon = (user.is_anonymous ?? false) && !!body.email
     if (body.email) {
       const email = body.email.toLowerCase().trim()
@@ -230,8 +346,8 @@ export class AuthHandler {
       sets.push(`email = $${params.length}, email_confirmed_at = now()`)
     }
     if (body.password) {
-      if (body.password.length < 6) {
-        return authError(422, 'weak_password', 'Password should be at least 6 characters.')
+      if (body.password.length < this.settings.minPasswordLength) {
+        return authError(422, 'weak_password', `Password should be at least ${this.settings.minPasswordLength} characters.`)
       }
       params.push(await hashPassword(body.password))
       sets.push(`encrypted_password = $${params.length}`)
@@ -274,12 +390,18 @@ export class AuthHandler {
 
   // ── OTP / magic links / recovery ──────────────────────────────────────
 
-  private async issueToken(email: string, tokenType: 'otp' | 'recovery', createUser: boolean): Promise<Response> {
+  private async issueToken(
+    email: string,
+    tokenType: 'otp' | 'recovery',
+    createUser: boolean,
+    flavor: 'login' | 'confirm' = 'login'
+  ): Promise<Response> {
     const normalized = email.toLowerCase().trim()
     let res = await this.db.query(`select * from auth.users where email = $1`, [normalized])
     let user = res.rows[0] as UserRow | undefined
     if (!user) {
       if (!createUser) return authError(422, 'otp_disabled', 'Signups not allowed for otp')
+      if (this.settings.disableSignup) return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
       res = await this.db.query(
         `insert into auth.users (aud, role, email, raw_app_meta_data, raw_user_meta_data)
          values ('authenticated', 'authenticated', $1, '{"provider":"email","providers":["email"]}', '{}')
@@ -288,23 +410,26 @@ export class AuthHandler {
       )
       user = res.rows[0] as UserRow
     }
-    const code = String(Math.floor(100000 + Math.random() * 900000))
+    const code = randomOtp(this.settings.otpLength)
     const linkToken = randomToken(24)
+    const expiry = `${this.settings.otpExpirySeconds} seconds`
     await this.db.query(`delete from auth.one_time_tokens where email = $1 and token_type = $2`, [normalized, tokenType])
     await this.db.query(
       `insert into auth.one_time_tokens (user_id, email, token_type, token, expires_at)
-       values ($1, $2, $3, $4, now() + interval '15 minutes'), ($1, $2, $5, $6, now() + interval '15 minutes')`,
-      [user.id, normalized, tokenType, code, tokenType === 'otp' ? 'magiclink' : tokenType, linkToken]
+       values ($1, $2, $3, $4, now() + $7::interval), ($1, $2, $5, $6, now() + $7::interval)`,
+      [user.id, normalized, tokenType, code, tokenType === 'otp' ? 'magiclink' : tokenType, linkToken, expiry]
     )
     const kind = tokenType === 'otp' ? 'magiclink' : tokenType
     const link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
     await this.config.mailer.send({
       to: normalized,
-      subject: tokenType === 'otp' ? 'Your login code' : 'Reset your password',
+      subject: tokenType === 'recovery' ? 'Reset your password' : flavor === 'confirm' ? 'Confirm your email' : 'Your login code',
       text:
-        tokenType === 'otp'
-          ? `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`
-          : `Reset your password with this link: ${link}\n\nOr use code ${code}`,
+        tokenType === 'recovery'
+          ? `Reset your password with this link: ${link}\n\nOr use code ${code}`
+          : flavor === 'confirm'
+            ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
+            : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`,
     })
     return json(200, {})
   }
@@ -365,7 +490,7 @@ export class AuthHandler {
     const body = (await req.json().catch(() => ({}))) as { type?: string; email?: string; token?: string }
     if (!body.token) return authError(400, 'validation_failed', 'token is required')
     // A recovery (password-reset) token must be redeemed with type=recovery
-    // explicitly — never fold it into the default set, or a guessed login OTP
+    // explicitly - never fold it into the default set, or a guessed login OTP
     // could mint a recovery session.
     const types =
       body.type === 'recovery' ? ['recovery'] : body.type === 'magiclink' ? ['magiclink'] : ['otp', 'magiclink']
@@ -377,7 +502,15 @@ export class AuthHandler {
   private async verifyLink(url: URL): Promise<Response> {
     const token = url.searchParams.get('token') ?? ''
     const type = url.searchParams.get('type') ?? 'magiclink'
-    const redirectTo = url.searchParams.get('redirect_to') ?? this.config.siteUrl
+    // Never redirect (with the freshly minted session tokens) to an origin the
+    // operator hasn't allowed - a crafted magic-link would otherwise exfiltrate
+    // the session. Unknown targets fall back to the site URL.
+    const redirectTo = resolveRedirect(
+      url.searchParams.get('redirect_to'),
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
     const user = await this.redeem(token, [type])
     if (!user) {
       return new Response(null, { status: 303, headers: { location: `${redirectTo}#error=access_denied&error_code=otp_expired` } })
@@ -508,7 +641,7 @@ export class AuthHandler {
   /**
    * Export everything held about one user across the auth schema, for a GDPR
    * right-of-access / portability request. Credentials (password hash, MFA
-   * secrets, raw token values) are deliberately omitted — they are not personal
+   * secrets, raw token values) are deliberately omitted - they are not personal
    * data to hand back and exporting them would leak secrets.
    */
   private async exportUser(userId: string): Promise<Response> {
@@ -561,7 +694,7 @@ export class AuthHandler {
    * doesn't exist and a summary of what was erased.
    *
    * Note: storage.objects.owner has no FK to auth.users, so object rows/bytes
-   * owned by the user are not removed here — see COMPLIANCE.md for the
+   * owned by the user are not removed here - see COMPLIANCE.md for the
    * storage-erasure step the operator must run.
    */
   private async eraseUser(userId: string): Promise<Response> {
@@ -596,6 +729,16 @@ export class AuthHandler {
     const factorType = body.factor_type ?? 'totp'
     if (factorType !== 'totp') {
       return authError(422, 'validation_failed', 'Only the totp factor type is supported')
+    }
+    if (!this.settings.totpEnrollEnabled) {
+      return authError(422, 'mfa_totp_enroll_disabled', 'TOTP enrollment is disabled')
+    }
+    const enrolled = await this.db.query(
+      `select count(*)::int as n from auth.mfa_factors where user_id = $1`,
+      [user.id]
+    )
+    if ((enrolled.rows[0] as { n: number }).n >= this.settings.maxEnrolledFactors) {
+      return authError(422, 'too_many_enrolled_mfa_factors', 'Maximum number of enrolled MFA factors reached')
     }
     const friendlyName = body.friendly_name ?? null
     if (friendlyName) {
@@ -635,6 +778,9 @@ export class AuthHandler {
   private async challengeFactor(req: Request, factorId: string): Promise<Response> {
     const user = await this.userFromBearer(req)
     if (!user) return authError(401, 'no_authorization', 'This endpoint requires a Bearer token')
+    if (!this.settings.totpVerifyEnabled) {
+      return authError(422, 'mfa_totp_verify_disabled', 'TOTP verification is disabled')
+    }
     const fr = await this.db.query(`select id from auth.mfa_factors where id = $1 and user_id = $2`, [factorId, user.id])
     if (fr.rows.length === 0) return authError(404, 'mfa_factor_not_found', 'MFA factor not found')
     const expiresAt = new Date(Date.now() + 300_000).toISOString()
@@ -718,6 +864,25 @@ export class AuthHandler {
     }))
   }
 
+  /** GoTrue-shaped identities for a user (linked providers), from auth.identities. */
+  private async getUserIdentities(userId: string): Promise<Record<string, unknown>[]> {
+    const res = await this.db.query(
+      `select id, provider_id, user_id, identity_data, provider, created_at, updated_at, last_sign_in_at
+       from auth.identities where user_id = $1 order by created_at`,
+      [userId]
+    )
+    return (res.rows as Record<string, unknown>[]).map((r) => ({
+      identity_id: r.id,
+      id: r.provider_id,
+      user_id: r.user_id,
+      identity_data: r.identity_data ?? {},
+      provider: r.provider,
+      last_sign_in_at: iso(r.last_sign_in_at as Date | string | null),
+      created_at: iso(r.created_at as Date | string | null),
+      updated_at: iso(r.updated_at as Date | string | null),
+    }))
+  }
+
   // ── helpers ───────────────────────────────────────────────────────────
 
   private async userFromBearer(req: Request): Promise<UserRow | null> {
@@ -729,7 +894,12 @@ export class AuthHandler {
     return (res.rows[0] as UserRow) ?? null
   }
 
-  userJson(u: UserRow, factors: Record<string, unknown>[] = []): Record<string, unknown> {
+  /** Shape a user row into the GoTrue user object supabase-js expects. */
+  userJson(
+    u: UserRow,
+    factors: Record<string, unknown>[] = [],
+    identities: Record<string, unknown>[] = []
+  ): Record<string, unknown> {
     return {
       id: u.id,
       aud: u.aud ?? 'authenticated',
@@ -741,7 +911,7 @@ export class AuthHandler {
       last_sign_in_at: iso(u.last_sign_in_at),
       app_metadata: u.raw_app_meta_data ?? {},
       user_metadata: u.raw_user_meta_data ?? {},
-      identities: [],
+      identities,
       factors,
       created_at: iso(u.created_at),
       updated_at: iso(u.updated_at),
@@ -766,7 +936,12 @@ export class AuthHandler {
     opts?: { aal?: string; amr?: { method: string; timestamp: number }[] }
   ): Promise<Record<string, unknown>> {
     const now = Math.floor(Date.now() / 1000)
-    const expiresAt = now + this.config.jwtExpiry
+    // Cap the access-token lifetime at the session timebox so a timeboxed
+    // session can't outlive its absolute deadline (config.toml auth.sessions.timebox).
+    const lifetime = this.config.sessionTimeboxSeconds
+      ? Math.min(this.config.jwtExpiry, this.config.sessionTimeboxSeconds)
+      : this.config.jwtExpiry
+    const expiresAt = now + lifetime
     const sessionId = crypto.randomUUID()
     const claims: JwtClaims = {
       iss: `${this.config.siteUrl}/auth/v1`,
@@ -793,10 +968,10 @@ export class AuthHandler {
     return {
       access_token: accessToken,
       token_type: 'bearer',
-      expires_in: this.config.jwtExpiry,
+      expires_in: lifetime,
       expires_at: expiresAt,
       refresh_token: refreshToken,
-      user: this.userJson(user, await this.getUserFactors(user.id)),
+      user: this.userJson(user, await this.getUserFactors(user.id), await this.getUserIdentities(user.id)),
     }
   }
 }

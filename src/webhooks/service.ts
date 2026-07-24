@@ -1,15 +1,18 @@
 /**
- * Database webhooks — fire an HTTP request when rows change, the tinbase
+ * Database webhooks - fire an HTTP request when rows change, the tinbase
  * equivalent of Supabase Database Webhooks (which use pg_net under the hood).
  * Built on the existing CDC pipeline (triggers + pg_notify), so it needs no C
  * extension and works on both engines. The POST body matches Supabase's
  * webhook payload exactly: { type, table, schema, record, old_record }.
  */
 import type { CdcEvent, Database } from '../db/database.js'
+import { guardedFetch } from '../net/service.js'
 
+/** A registered database webhook: which changes to watch and where to POST them. */
 export interface WebhookConfig {
   /** table to watch */
   table: string
+  /** schema of the watched table; defaults to 'public' */
   schema?: string
   /** which events fire the hook; default all */
   events?: ('INSERT' | 'UPDATE' | 'DELETE')[]
@@ -23,14 +26,20 @@ export interface WebhookConfig {
   timeoutMs?: number
 }
 
+/** Result of one webhook delivery attempt, passed to the optional `onDelivery` callback. */
 export interface WebhookDelivery {
   webhook: WebhookConfig
+  /** the CDC event that triggered this delivery */
   event: CdcEvent
+  /** HTTP response status; null when the request never got a reply (error/blocked) */
   status: number | null
+  /** true when the response was 2xx */
   ok: boolean
+  /** failure reason (network error, blocked SSRF target); undefined on success */
   error?: string
 }
 
+/** Watches the CDC stream and POSTs matching row changes to registered webhooks. */
 export class WebhooksService {
   private hooks: WebhookConfig[] = []
   private stop: (() => void) | null = null
@@ -39,9 +48,16 @@ export class WebhooksService {
   constructor(
     private db: Database,
     private fetchImpl: typeof fetch = fetch,
-    private onDelivery?: (d: WebhookDelivery) => void
+    private onDelivery?: (d: WebhookDelivery) => void,
+    /**
+     * Block delivery to loopback/private/link-local targets (SSRF guard). Off by
+     * default so local dev can point a webhook at a local edge function, as
+     * `supabase start` does; the backend turns it on when network-exposed.
+     */
+    private restrictTargets = false
   ) {}
 
+  /** All currently registered webhooks. */
   list(): WebhookConfig[] {
     return [...this.hooks]
   }
@@ -53,6 +69,7 @@ export class WebhooksService {
     await this.ensureStarted()
   }
 
+  /** Register an initial set of webhooks and start dispatching if any exist. */
   async start(initial: WebhookConfig[] = []): Promise<void> {
     for (const h of initial) {
       this.hooks.push(h)
@@ -67,6 +84,7 @@ export class WebhooksService {
     this.stop = await this.db.onCdcEvent((e) => this.dispatch(e))
   }
 
+  /** Unsubscribe from the CDC stream; registered hooks are retained. */
   stopService(): void {
     this.stop?.()
     this.stop = null
@@ -94,12 +112,17 @@ export class WebhooksService {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), hook.timeoutMs ?? 5000)
     try {
-      const res = await this.fetchImpl(hook.url, {
+      const init: RequestInit = {
         method: hook.method ?? 'POST',
         headers: { 'content-type': 'application/json', ...(hook.headers ?? {}) },
         body: JSON.stringify(payload),
         signal: controller.signal,
-      })
+      }
+      // When network-exposed, apply the SSRF guard (incl. redirect re-validation);
+      // on loopback dev, deliver directly so localhost webhooks still work.
+      const res = this.restrictTargets
+        ? await guardedFetch(this.fetchImpl, hook.url, init)
+        : await this.fetchImpl(hook.url, init)
       this.onDelivery?.({ webhook: hook, event, status: res.status, ok: res.ok })
     } catch (e) {
       this.onDelivery?.({

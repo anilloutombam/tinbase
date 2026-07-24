@@ -1,5 +1,5 @@
 /**
- * Schema snapshot + diff — the engine behind `tinbase db diff`.
+ * Schema snapshot + diff - the engine behind `tinbase db diff`.
  *
  * Snapshots a schema (tables, columns, constraints, indexes, enums) into a
  * structured form, then emits the DDL to turn one snapshot into another. Used
@@ -9,30 +9,39 @@
  * Covered: enums (create + add value), tables (create/drop), columns
  * (add/drop/alter type/nullability/default), and named constraints + indexes
  * (add/drop by definition). Not yet diffed: functions, triggers, policies,
- * views — noted so the output never silently claims completeness.
+ * views - noted so the output never silently claims completeness.
  */
 import { quoteIdent } from './database.js'
 import type { Database } from './database.js'
 
 interface ColumnSnap {
   name: string
+  /** fully-specified type from format_type (e.g. `character varying(255)`) */
   type: string
   nullable: boolean
+  /** column default expression, or null when none */
   default: string | null
 }
 interface TableSnap {
   name: string
   columns: Map<string, ColumnSnap>
+  /** column names in declaration order, so DDL is emitted deterministically */
   order: string[]
 }
+
+/** A structured snapshot of one schema, diffable into DDL by {@link diffSchemas}. */
 export interface SchemaSnapshot {
+  /** table name → its columns */
   tables: Map<string, TableSnap>
-  /** constraint/index name → definition, keyed by table */
+  /** table → (constraint name → definition from pg_get_constraintdef) */
   constraints: Map<string, Map<string, string>>
+  /** table → (index name → definition from pg_get_indexdef), excluding constraint-backing indexes */
   indexes: Map<string, Map<string, string>>
+  /** enum type name → its labels in sort order */
   enums: Map<string, string[]>
 }
 
+/** Snapshot a schema's tables, columns, constraints, indexes, and enums. */
 export async function snapshotSchema(db: Database, schema = 'public'): Promise<SchemaSnapshot> {
   const cols = await db.query<{ table: string; column: string; type: string; nullable: boolean; default: string | null }>(
     `select c.relname as table, a.attname as column,
@@ -157,19 +166,31 @@ export function diffSchemas(from: SchemaSnapshot, to: SchemaSnapshot, schema = '
   }
 
   // ── dropped tables ──
+  // `drop table` cascades the table's own constraints and indexes, so the
+  // constraint/index diffs below must skip anything on a table dropped here -
+  // otherwise they emit `alter table … drop constraint` against a table that no
+  // longer exists, and the generated migration fails to apply.
+  const droppedTables = new Set<string>()
   for (const name of from.tables.keys()) {
-    if (!to.tables.has(name)) out.push(`drop table ${tbl(name)};`)
+    if (!to.tables.has(name)) {
+      out.push(`drop table ${tbl(name)};`)
+      droppedTables.add(name)
+    }
   }
 
   // ── constraints (drop changed/removed, then add new) ──
   diffNamed(from.constraints, to.constraints, {
-    drop: (table, cname) => out.push(`alter table ${tbl(table)} drop constraint ${q(cname)};`),
+    drop: (table, cname) => {
+      if (!droppedTables.has(table)) out.push(`alter table ${tbl(table)} drop constraint ${q(cname)};`)
+    },
     add: (table, cname, def) => out.push(`alter table ${tbl(table)} add constraint ${q(cname)} ${def};`),
   })
 
   // ── indexes (drop changed/removed, then add new) ──
   diffNamed(from.indexes, to.indexes, {
-    drop: (_table, iname) => out.push(`drop index ${q(schema)}.${q(iname)};`),
+    drop: (table, iname) => {
+      if (!droppedTables.has(table)) out.push(`drop index ${q(schema)}.${q(iname)};`)
+    },
     add: (_table, _iname, def) => out.push(`${def};`),
   })
 

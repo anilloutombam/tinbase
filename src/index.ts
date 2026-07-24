@@ -1,5 +1,5 @@
 /**
- * tinbase — a pure-JS, Docker-free Supabase backend on PGlite that speaks
+ * tinbase - a pure-JS, Docker-free Supabase backend on PGlite that speaks
  * the same wire protocols as hosted Supabase, so the official supabase-js
  * SDK works unchanged.
  *
@@ -10,10 +10,12 @@
 import { AdminApi } from './admin/api.js'
 import { ADMIN_HTML } from './admin/ui.js'
 import { AuthHandler } from './auth/handler.js'
+import { RateLimiter } from './auth/rate-limit.js'
 import { InboxMailer } from './auth/inbox.js'
+import { loadAuthSettings } from './auth/settings.js'
 import { LogBuffer } from './log-buffer.js'
 import { FunctionsHandler, type EdgeFunction } from './functions/handler.js'
-import { installDenoShim, setDenoEnv } from './functions/deno-shim.js'
+import { installDenoShim } from './functions/deno-shim.js'
 import { Database } from './db/database.js'
 import { signJwt, verifyJwt } from './jwt.js'
 import { RealtimeEngine } from './realtime/engine.js'
@@ -25,6 +27,7 @@ import { CronService } from './cron/service.js'
 import { NetService, type NetDelivery } from './net/service.js'
 import { RetentionService } from './retention/service.js'
 import { DEFAULT_JWT_SECRET, type BackendConfig, type Mailer, type MigrationFile, type RequestContext } from './types.js'
+import { assertSecretsSafe, isNetworkExposed } from './security.js'
 
 export * from './types.js'
 export { Database } from './db/database.js'
@@ -37,7 +40,7 @@ export { RealtimeEngine, type RealtimeSocketLike } from './realtime/engine.js'
 export { signJwt, verifyJwt, decodeJwt } from './jwt.js'
 export { FunctionsHandler, type EdgeFunction, type FunctionContext } from './functions/handler.js'
 export { generateTypes } from './gen-types.js'
-export { installDenoShim, setDenoEnv } from './functions/deno-shim.js'
+export { installDenoShim } from './functions/deno-shim.js'
 export { WebhooksService, type WebhookConfig, type WebhookDelivery } from './webhooks/service.js'
 export { CronService, cronMatches } from './cron/service.js'
 export { NetService, type NetDelivery } from './net/service.js'
@@ -45,20 +48,34 @@ export { RetentionService, type RetentionConfig } from './retention/service.js'
 export { snapshotSchema, diffSchemas, type SchemaSnapshot } from './db/schema-diff.js'
 export { inspectDb, type TableInfo } from './db/inspect.js'
 
+/**
+ * A running tinbase backend. The one field a consumer always needs is
+ * {@link TinbaseBackend.fetch}; the rest expose the underlying services for
+ * advanced/embedded use (in-process realtime, manual migrations, log access).
+ * Returned by {@link createBackend}.
+ */
 export interface TinbaseBackend {
   /** The whole backend as a fetch handler. Pass to supabase-js as global.fetch for in-process use. */
   fetch: (req: Request) => Promise<Response>
+  /** The database engine wrapper - run raw SQL, inspect schema, apply migrations. */
   db: Database
+  /** Realtime (Postgres CDC → WebSocket) engine backing supabase.channel(). */
   realtime: RealtimeEngine
+  /** Edge-function registry/dispatcher backing supabase.functions.invoke(). */
   functions: FunctionsHandler
+  /** Database-webhook service (HTTP requests fired on row changes). */
   webhooks: WebhooksService
+  /** pg_cron emulation scheduler. */
   cron: CronService
+  /** pg_net emulation sender (net.http_* queue drain). */
   net: NetService
+  /** Background sweeper that purges expired tokens and aged-out audit rows. */
   retention: RetentionService
-  /** JWT for the anon role — use as supabase-js's supabaseKey. */
+  /** JWT for the anon role - use as supabase-js's supabaseKey. */
   anonKey: string
-  /** JWT for the service_role — bypasses RLS. */
+  /** JWT for the service_role - bypasses RLS. */
   serviceRoleKey: string
+  /** Secret used to sign/verify every JWT (the resolved value, incl. the default). */
   jwtSecret: string
   /** Recent server logs (also surfaced in the Studio Logs pane). */
   logs: LogBuffer
@@ -66,7 +83,32 @@ export interface TinbaseBackend {
   inbox: InboxMailer | null
   /** Apply additional migrations at runtime. */
   migrate: (migrations: MigrationFile[], seedSql?: string) => Promise<string[]>
+  /** Tear down every background service and close the database. Idempotent-safe to await once. */
   close: () => Promise<void>
+}
+
+/**
+ * Content-Security-Policy for the studio shell. The build inlines all JS/CSS
+ * into one document, so `'unsafe-inline'` is unavoidable for scripts/styles;
+ * everything else is locked to same-origin, `frame-ancestors 'none'` blocks
+ * clickjacking, and `object-src 'none'` blocks plugin content.
+ */
+const ADMIN_CSP =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; " +
+  "base-uri 'self'; frame-ancestors 'none'"
+
+/** Stable weak ETag for the (constant) studio HTML, so reloads revalidate to 304. */
+const ADMIN_ETAG = `W/"${fnv1a(ADMIN_HTML)}"`
+
+/** FNV-1a 32-bit hash as an 8-char hex string. Non-cryptographic, ETag-only. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -78,6 +120,21 @@ const CORS_HEADERS: Record<string, string> = {
   'access-control-max-age': '86400',
 }
 
+/**
+ * Build a running tinbase backend from {@link BackendConfig}. Wires the
+ * database, auth, storage, realtime, edge functions, and the background
+ * services (webhooks/cron/net/retention), mints the anon/service_role keys, and
+ * returns a {@link TinbaseBackend} whose `fetch` handles every Supabase wire
+ * route.
+ *
+ * All config is optional: with an empty config it boots an in-memory PGlite
+ * backend on the Supabase local-dev defaults. If any startup step throws (e.g. a
+ * failing migration), every handle opened so far is torn down before the error
+ * propagates, so a failed construction never leaks the engine or a timer.
+ *
+ * @throws Error from {@link assertSecretsSafe} when bound to a network-exposed
+ *   host with a weak/default JWT secret or a derived vault key.
+ */
 export async function createBackend(config: BackendConfig = {}): Promise<TinbaseBackend> {
   const jwtSecret = config.jwtSecret ?? DEFAULT_JWT_SECRET
   const siteUrl = config.siteUrl ?? 'http://localhost:54321'
@@ -95,7 +152,13 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
   // Vault encryption key: use the configured value, else derive one from the
   // JWT secret so vault secrets are encrypted at rest out of the box (better
   // than the old plaintext store). Set a dedicated vaultKey in production.
+  const vaultKeyDerived = config.vaultKey === undefined
   const vaultKey = config.vaultKey ?? `tinbase-vault:${jwtSecret}`
+
+  // Weak/default secrets are fine on loopback; refuse to start with them when
+  // the server is bound to a network-exposed host.
+  assertSecretsSafe({ host: config.host, jwtSecret, vaultKeyDerived, warn: log })
+
   // Resolve an external-Postgres engine on demand (Node only) so the browser
   // core never imports the wire client.
   let engine = config.engine
@@ -103,10 +166,26 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     const { createDatabaseUrlEngine } = await import('./node/native/database-url.js')
     engine = await createDatabaseUrlEngine({ databaseUrl: config.databaseUrl, log })
   }
+
   const db = await Database.create(engine ?? config.dataDir, { vaultKey })
-  if (config.migrations?.length || config.seedSql) {
-    const applied = await db.runMigrations(config.migrations ?? [], config.seedSql)
-    if (applied.length > 0) log(`applied migrations: ${applied.join(', ')}`)
+
+  // Anything created after the engine (a running native Postgres child, the
+  // realtime LISTEN, background timers) must be torn down if a later step throws
+  // - e.g. a failing migration - so a construction error never leaks a handle.
+  const cleanup: Array<() => void | Promise<void>> = []
+  const failStartup = async (e: unknown): Promise<never> => {
+    for (const fn of cleanup.reverse()) await Promise.resolve(fn()).catch(() => {})
+    await db.close().catch(() => {})
+    throw e
+  }
+
+  try {
+    if (config.migrations?.length || config.seedSql) {
+      const applied = await db.runMigrations(config.migrations ?? [], config.seedSql)
+      if (applied.length > 0) log(`applied migrations: ${applied.join(', ')}`)
+    }
+  } catch (e) {
+    await failStartup(e)
   }
 
   const now = Math.floor(Date.now() / 1000)
@@ -117,12 +196,12 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     jwtSecret
   )
 
-  const rest = new RestHandler(db)
+  const rest = new RestHandler(db, { exposedSchemas: config.dbSchemas, maxRows: config.maxRows })
   // With no custom mailer, capture auth emails in an in-memory inbox (viewable
   // at /inbox) and log a metadata-only line. A provided mailer takes over and no
   // inbox is mounted.
   //
-  // The server log records only the recipient and subject — never the body,
+  // The server log records only the recipient and subject - never the body,
   // which carries OTP codes and magic links. Set logMailBody: true to also log
   // the full body for local debugging (the /inbox UI always shows it in full).
   const inbox = config.mailer
@@ -135,35 +214,59 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
         )
       )
   const mailer: Mailer = config.mailer ?? inbox!
+  // one shared runtime-settings object: config.toml [auth] provides the
+  // committed defaults, the persisted auth.config row layers live studio edits
+  // on top, and the auth handler reads the merged object per request
+  const authSettings = await loadAuthSettings(db, config.authSettings)
+  const storage = new StorageHandler(db, config.storageDriver ?? new MemoryStorageDriver(), {
+    jwtSecret,
+    defaultFileSizeLimit: config.storageFileSizeLimit,
+    log,
+  })
+  if (config.buckets?.length) await storage.ensureBuckets(config.buckets)
   const auth = new AuthHandler(db, {
     jwtSecret,
     siteUrl,
     jwtExpiry,
+    sessionTimeboxSeconds: config.sessionTimeboxSeconds,
     mailer,
     oauthProviders: config.oauthProviders,
     oauthFetch: config.oauthFetch,
+    uriAllowList: config.uriAllowList,
+    enforceRedirectAllowList: isNetworkExposed(config.host),
+    settings: authSettings,
+    rateLimiter: new RateLimiter(config.authRateLimits),
   })
-  const storage = new StorageHandler(db, config.storageDriver ?? new MemoryStorageDriver(), { jwtSecret, log })
+  cleanup.push(() => auth.stop())
+
   const realtime = new RealtimeEngine(db, jwtSecret)
-  await realtime.start()
-
-  const webhooks = new WebhooksService(db, config.webhookFetch, (d: WebhookDelivery) =>
-    log(`[webhook] ${d.event.type} ${d.event.schema}.${d.event.table} -> ${d.webhook.url} ${d.ok ? d.status : 'FAILED ' + (d.error ?? '')}`)
+  const webhooks = new WebhooksService(
+    db,
+    config.webhookFetch,
+    (d: WebhookDelivery) =>
+      log(`[webhook] ${d.event.type} ${d.event.schema}.${d.event.table} -> ${d.webhook.url} ${d.ok ? d.status : 'FAILED ' + (d.error ?? '')}`),
+    isNetworkExposed(config.host)
   )
-  if (config.webhooks?.length) await webhooks.start(config.webhooks)
-
   const cron = new CronService(db)
-  cron.start()
-
   const retention = new RetentionService(db, config.retention)
-  retention.start()
-
   const net = new NetService(db, config.netFetch, undefined, (d: NetDelivery) =>
     log(`[net] ${d.method} ${d.url} -> ${d.timedOut ? 'TIMEOUT' : d.error ? 'FAILED ' + d.error : d.status}`)
   )
-  net.start()
 
-  const admin = new AdminApi(db, logs)
+  try {
+    await realtime.start()
+    cleanup.push(() => realtime.stop())
+    if (config.webhooks?.length) await webhooks.start(config.webhooks)
+    cleanup.push(() => webhooks.stopService())
+    cron.start()
+    cleanup.push(() => cron.stop())
+    retention.start()
+    cleanup.push(() => retention.stop())
+    net.start()
+    cleanup.push(() => net.stop())
+  } catch (e) {
+    await failStartup(e)
+  }
 
   const fnMap =
     config.functions instanceof Map
@@ -175,9 +278,25 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     SUPABASE_SERVICE_ROLE_KEY: serviceRoleKey,
     ...(config.functionEnv ?? {}),
   }
-  // make these visible to Deno.serve-style functions via the shim's Deno.env
+
+  const admin = new AdminApi(
+    db,
+    logs,
+    { anonKey, jwtSecret },
+    {
+      edgeFunctions: [...fnMap.keys()],
+      oauthProviders: Object.keys(config.oauthProviders ?? {}),
+      inbox: inbox !== null,
+      webhooks: config.webhooks ?? [],
+      authSettings,
+      functionEnv: fnEnv,
+    }
+  )
+
+  // install the Deno global once per process; the shim's Deno.env is bound to
+  // this backend's fnEnv per-invocation by FunctionsHandler (so backends don't
+  // share env through the global).
   installDenoShim()
-  setDenoEnv(fnEnv)
   const functions = new FunctionsHandler(fnMap as Map<string, EdgeFunction>, fnEnv)
 
   async function resolveContext(req: Request, url: URL): Promise<RequestContext | Response> {
@@ -229,8 +348,23 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
       )
     }
 
-    if (path === '/_' || path === '/_/') {
-      return new Response(ADMIN_HTML, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+    // studio SPA - serve the shell for every /_/* route so deep links work.
+    // no-cache forces revalidation (the whole app is inlined in this one
+    // document); the ETag then lets an unchanged studio return 304 instead of
+    // re-sending the full ~0.6 MB body. A strict CSP hardens the shell.
+    if (path === '/_' || path.startsWith('/_/')) {
+      const headers: Record<string, string> = {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-cache',
+        'content-security-policy': ADMIN_CSP,
+        'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+        etag: ADMIN_ETAG,
+      }
+      if (req.headers.get('if-none-match') === ADMIN_ETAG) {
+        return new Response(null, { status: 304, headers })
+      }
+      return new Response(ADMIN_HTML, { status: 200, headers })
     }
 
     // local email inbox (dev-only; mounted only when using the default mailer)
@@ -249,6 +383,14 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
         return withCors(await storage.handle(req, { role: 'anon', claims: null }, url))
       }
     }
+    if (config.authEnabled === false && path.startsWith('/auth/v1')) {
+      return withCors(
+        new Response(JSON.stringify({ message: 'Auth service is disabled' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        })
+      )
+    }
     if (
       (path === '/auth/v1/verify' || path === '/auth/v1/authorize' || path === '/auth/v1/callback') &&
       (req.method === 'GET' || req.method === 'POST')
@@ -259,7 +401,8 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     if (path.startsWith('/auth/v1/')) {
       // GoTrue validates the apikey header, but user JWTs ride Authorization
       const apikey = req.headers.get('apikey') ?? url.searchParams.get('apikey')
-      if (!apikey || !(await verifyJwt(apikey, jwtSecret))) {
+      const keyClaims = apikey ? await verifyJwt(apikey, jwtSecret) : null
+      if (!keyClaims) {
         return withCors(
           new Response(JSON.stringify({ message: 'No API key found in request' }), {
             status: 401,
@@ -267,8 +410,7 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
           })
         )
       }
-      const keyClaims = await verifyJwt(apikey, jwtSecret)
-      const ctx: RequestContext = { role: String(keyClaims?.role ?? 'anon'), claims: keyClaims }
+      const ctx: RequestContext = { role: String(keyClaims.role ?? 'anon'), claims: keyClaims }
       return withCors(await auth.handle(req, ctx, url))
     }
 
@@ -295,10 +437,28 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     )
   }
 
+  // Last-resort guard: the fetch contract is Request → Response, so an
+  // unexpected throw from any handler must become a 500, never a rejected fetch
+  // (in-process/browser callers have no HTTP layer to convert a rejection).
+  const safeHandle = async (req: Request): Promise<Response> => {
+    try {
+      return await handle(req)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      log(`[error] unhandled: ${msg}`)
+      return withCors(
+        new Response(JSON.stringify({ message: 'Internal Server Error' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        })
+      )
+    }
+  }
+
   // request logging for the Logs pane (skip health checks and the log-polling
   // endpoint itself to avoid noise / self-reference)
   const loggedFetch = async (req: Request): Promise<Response> => {
-    const res = await handle(req)
+    const res = await safeHandle(req)
     try {
       const p = new URL(req.url).pathname
       if (p !== '/health' && p !== '/' && p !== '/admin/v1/logs') {
@@ -327,8 +487,9 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     inbox,
     migrate: (migrations, seedSql) => db.runMigrations(migrations, seedSql),
     close: async () => {
-      cron.stop()
-      net.stop()
+      auth.stop()
+      await cron.stop()
+      await net.stop()
       await retention.stop()
       webhooks.stopService()
       realtime.stop()
@@ -337,6 +498,7 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
   }
 }
 
+/** Add the permissive CORS headers to a response, leaving any already-set header untouched. */
 function withCors(res: Response): Response {
   for (const [k, v] of Object.entries(CORS_HEADERS)) {
     if (!res.headers.has(k)) res.headers.set(k, v)

@@ -8,7 +8,7 @@ import { bundleFunction } from './bundle-function.js'
 
 /**
  * Load edge-function secrets from supabase/functions/.env (KEY=VALUE lines,
- * `#` comments). These are exposed to functions via Deno.env and ctx.env —
+ * `#` comments). These are exposed to functions via Deno.env and ctx.env -
  * the local equivalent of `supabase functions serve --env-file`.
  */
 export async function loadFunctionEnv(projectDir: string): Promise<Record<string, string>> {
@@ -34,7 +34,26 @@ export async function loadFunctionEnv(projectDir: string): Promise<Record<string
   return env
 }
 
-export async function loadFunctions(projectDir: string): Promise<Map<string, EdgeFunction>> {
+/** Per-function options from config.toml [functions.<name>]. */
+export interface LoadFunctionOptions {
+  /** Skip loading when explicitly disabled. */
+  enabled?: boolean
+  /** Custom entrypoint path, relative to the project root. */
+  entrypoint?: string
+}
+
+/**
+ * Discover and load every edge function under supabase/functions/, keyed by
+ * directory name. Dirs starting with `_` or `.` are skipped (shared code), as
+ * are functions disabled in config.toml. Each function is bundled with esbuild
+ * when available (falling back to a plain import), then its handler is taken
+ * from a default export or a captured `Deno.serve()` call. Load failures warn
+ * and skip rather than throwing, so one broken function can't block startup.
+ */
+export async function loadFunctions(
+  projectDir: string,
+  options: Record<string, LoadFunctionOptions> = {}
+): Promise<Map<string, EdgeFunction>> {
   const functions = new Map<string, EdgeFunction>()
   const root = join(projectDir, 'supabase', 'functions')
 
@@ -50,10 +69,14 @@ export async function loadFunctions(projectDir: string): Promise<Map<string, Edg
 
   for (const name of entries) {
     if (name.startsWith('_') || name.startsWith('.')) continue
+    if (options[name]?.enabled === false) continue // disabled in config.toml
     const dir = join(root, name)
     if (!(await stat(dir)).isDirectory()) continue
-    for (const file of ['index.ts', 'index.tsx', 'index.js', 'index.mjs']) {
-      const path = join(dir, file)
+    // A config.toml entrypoint overrides the default index.* discovery.
+    const candidates = options[name]?.entrypoint
+      ? [join(projectDir, options[name].entrypoint!)]
+      : ['index.ts', 'index.tsx', 'index.js', 'index.mjs'].map((f) => join(dir, f))
+    for (const path of candidates) {
       try {
         await stat(path)
       } catch {

@@ -1,8 +1,13 @@
+/**
+ * Turns thrown errors into PostgREST-shaped JSON error responses
+ * ({ code, message, details, hint }) and maps Postgres SQLSTATEs to HTTP
+ * statuses the way PostgREST does.
+ */
 import { ApiError } from '../types.js'
 import { ParseError } from './parse.js'
 
 /** HTTP status for a Postgres SQLSTATE, following PostgREST's mapping. */
-function statusForSqlState(code: string): number {
+export function statusForSqlState(code: string): number {
   switch (code) {
     case '42501':
       return 403
@@ -22,6 +27,7 @@ function statusForSqlState(code: string): number {
   }
 }
 
+/** Shape of a node-postgres / pg-mem error carrying a SQLSTATE. */
 interface PgError {
   code?: string
   message: string
@@ -29,6 +35,11 @@ interface PgError {
   hint?: string
 }
 
+/**
+ * Normalize any thrown value into a JSON Response: ApiError/ParseError keep
+ * their status; anything with a 5-char SQLSTATE is mapped via
+ * {@link statusForSqlState}; everything else becomes a 500.
+ */
 export function errorToResponse(e: unknown): Response {
   if (e instanceof ApiError) {
     return jsonResponse(e.status, e.body)
@@ -49,6 +60,7 @@ export function errorToResponse(e: unknown): Response {
   return jsonResponse(500, { code: 'PGRST500', message, details: null, hint: null })
 }
 
+/** JSON Response helper; status 204 sends no body. */
 export function jsonResponse(
   status: number,
   body: unknown,
