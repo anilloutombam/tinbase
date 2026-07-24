@@ -435,6 +435,7 @@ function decodeValue(text: string, oid: number): unknown {
     case 1007: // _int4
     case 1016: // _int8
       return parsePgArray(text).map((v) => (v === null ? null : Number(v)))
+    case 1003: // _name (e.g. array_agg over pg_enum.enumlabel / catalog name columns)
     case 1009: // _text
     case 1015: // _varchar
       return parsePgArray(text)
