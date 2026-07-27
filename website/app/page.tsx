@@ -96,8 +96,8 @@ const RELATED = [
   },
   {
     name: 'jetplane',
-    href: 'https://jetplane.vercel.app',
-    logo: 'https://jetplane.vercel.app/logo.svg',
+    href: 'https://sanketsahu.github.io/jetplane',
+    logo: 'https://sanketsahu.github.io/jetplane/logo.svg',
     desc: 'A Metro plugin and a lightweight dev server for Expo & React Native — many dev environments per machine.',
   },
   {
