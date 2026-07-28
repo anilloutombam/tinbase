@@ -222,12 +222,23 @@ export class AdminApi {
     this.db.invalidateSchemaCache()
     const info = await this.db.getSchemaInfo(schema)
     // information_schema.columns includes views, so flag them - the studio
-    // renders views read-only instead of complaining about a missing PK
-    const viewRows = await this.db.query<{ table_name: string }>(
-      `select table_name from information_schema.views where table_schema = $1`,
-      [schema]
-    )
-    const views = new Set(viewRows.rows.map((v) => v.table_name))
+    // renders views read-only instead of complaining about a missing PK.
+    //
+    // Guarded like the per-table count below: the pgmem preview engine has no
+    // information_schema.views, and an unguarded throw here failed the whole
+    // request, so the studio's table browser showed "No tables yet" for a
+    // database full of tables. No views on that engine either, so an empty set
+    // is the right answer rather than a degraded one.
+    let views = new Set<string>()
+    try {
+      const viewRows = await this.db.query<{ table_name: string }>(
+        `select table_name from information_schema.views where table_schema = $1`,
+        [schema]
+      )
+      views = new Set(viewRows.rows.map((v) => v.table_name))
+    } catch {
+      // engine without information_schema.views - treat everything as a table
+    }
     const tables = []
     for (const t of info.tables.values()) {
       // A single table whose count fails (e.g. an engine gap in an RLS policy's

@@ -4,7 +4,42 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
-## [Unreleased]
+## [0.10.2]
+
+### Fixed
+- **Studio's table browser worked on the pgmem engine again.** `listTables` asks
+  `information_schema.views` which tables are views, so it can render those
+  read-only. pg-mem has no `information_schema.views`, so that query threw and
+  failed the whole request — the studio reported "No tables yet" for a database
+  full of tables, while the dashboard card next to it correctly counted 14. The
+  query is now guarded the same way the per-table `count(*)` already was (that
+  guard's comment even names the pgmem engine); an engine without views yields an
+  empty set, which is the right answer there rather than a degraded one.
+
+## [0.10.1]
+
+### Fixed
+- **Studio deep links serve the app shell again.** `src` has routed every `/_/*`
+  path to the shell for a while, but the shipped `dist` predated that change, so
+  `/_/table` and `/_/database/functions` fell through to the REST handler and
+  answered `401 {"message":"No API key found in request"}` — on refresh, on a
+  deep link, and on back/forward. This release simply rebuilds, which is also why
+  it is worth publishing on its own.
+- **Studio works when embedded in a document whose location it doesn't control.**
+  The router read `window.location.pathname`, which is `[Unforgeable]` — an
+  embedder cannot virtualize it. It now reads `new URL(document.URL).pathname`,
+  identical under normal hosting and virtualizable when embedded. This is what
+  lets Lifo render the Studio from an in-VM tinbase inside a `blob:` iframe with
+  no service worker; without it every nav click stayed on the home tab.
+
+### Released here too — the Studio rebuild
+
+Everything below shipped in this release rather than in 0.10.0. `src/admin/ui.ts`
+has carried the rebuilt Studio since 2026-07-11, but 0.10.0's published `dist/`
+predated it and served the old ~296 kB Studio; 0.10.1 is the first release built
+from current sources, so the embedded Studio goes ~296 kB → ~1.32 MB (the table
+editor, database panes and an inlined `ace` SQL editor, all in one self-contained
+document because of `vite-plugin-singlefile`).
 
 Rebuilds the Studio, adds the backend surface it needs, and adds the guardrails
 and fixes needed to expose tinbase beyond localhost.
