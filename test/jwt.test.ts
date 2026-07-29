@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { signJwt, verifyJwt } from '../src/jwt.js'
+import { deriveApiKeys, signJwt, verifyJwt } from '../src/jwt.js'
+import { DEFAULT_JWT_SECRET } from '../src/types.js'
 
 const SECRET = 'test-secret-at-least-32-characters-long!!'
 
@@ -35,5 +36,32 @@ describe('jwt', () => {
     const [, payload, sig] = valid.split('.')
     const swapped = `${b64url({ alg: 'RS256', typ: 'JWT' })}.${payload}.${sig}`
     expect(await verifyJwt(swapped, SECRET)).toBeNull()
+  })
+})
+
+describe('deriveApiKeys', () => {
+  it('with the default secret, deterministic keys are byte-identical to the Supabase demo keys', async () => {
+    const { anonKey, serviceRoleKey } = await deriveApiKeys(DEFAULT_JWT_SECRET)
+    expect(anonKey).toBe(
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0'
+    )
+    expect(serviceRoleKey).toBe(
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU'
+    )
+  })
+
+  it('deterministic keys are stable across calls for a custom secret and verify against it', async () => {
+    const a = await deriveApiKeys(SECRET)
+    const b = await deriveApiKeys(SECRET)
+    expect(a).toEqual(b)
+    expect((await verifyJwt(a.anonKey, SECRET))?.role).toBe('anon')
+    expect((await verifyJwt(a.serviceRoleKey, SECRET))?.role).toBe('service_role')
+  })
+
+  it('unique mode signs fresh keys carrying an iat', async () => {
+    const { anonKey } = await deriveApiKeys(SECRET, 'unique')
+    const claims = await verifyJwt(anonKey, SECRET)
+    expect(claims?.role).toBe('anon')
+    expect(typeof claims?.iat).toBe('number')
   })
 })

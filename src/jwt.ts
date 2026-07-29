@@ -86,6 +86,39 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtClaim
   }
 }
 
+/** Expiry claim (2032-11-11) shared by all deterministic dev keys — the same value Supabase's local demo keys use. */
+export const DEMO_KEY_EXP = 1983812996
+
+/**
+ * Derive the anon/service_role API keys for a backend.
+ *
+ * `'deterministic'` (local dev): signs the same fixed claims Supabase's local
+ * stack uses (`iss: "supabase-demo"`, `exp` {@link DEMO_KEY_EXP}), so the keys
+ * are stable across restarts and machines — with the default secret they are
+ * byte-identical to the well-known Supabase demo keys, so a `.env.local` can be
+ * committed and shared.
+ *
+ * `'unique'` (production): signs fresh claims with `iat` = now and a 10-year
+ * expiry, so every start yields distinct keys.
+ */
+export async function deriveApiKeys(
+  jwtSecret: string,
+  mode: 'deterministic' | 'unique' = 'deterministic'
+): Promise<{ anonKey: string; serviceRoleKey: string }> {
+  if (mode === 'unique') {
+    const now = Math.floor(Date.now() / 1000)
+    const exp = now + 10 * 365 * 24 * 3600
+    return {
+      anonKey: await signJwt({ iss: 'supabase', ref: 'tinbase', role: 'anon', iat: now, exp }, jwtSecret),
+      serviceRoleKey: await signJwt({ iss: 'supabase', ref: 'tinbase', role: 'service_role', iat: now, exp }, jwtSecret),
+    }
+  }
+  return {
+    anonKey: await signJwt({ iss: 'supabase-demo', role: 'anon', exp: DEMO_KEY_EXP }, jwtSecret),
+    serviceRoleKey: await signJwt({ iss: 'supabase-demo', role: 'service_role', exp: DEMO_KEY_EXP }, jwtSecret),
+  }
+}
+
 /** Decode without verification (for introspection/debugging only). */
 export function decodeJwt(token: string): JwtClaims | null {
   const parts = token.split('.')

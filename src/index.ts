@@ -17,7 +17,7 @@ import { LogBuffer } from './log-buffer.js'
 import { FunctionsHandler, type EdgeFunction } from './functions/handler.js'
 import { installDenoShim } from './functions/deno-shim.js'
 import { Database } from './db/database.js'
-import { signJwt, verifyJwt } from './jwt.js'
+import { deriveApiKeys, verifyJwt } from './jwt.js'
 import { RealtimeEngine } from './realtime/engine.js'
 import { RestHandler } from './rest/handler.js'
 import { MemoryStorageDriver } from './storage/driver.js'
@@ -37,7 +37,7 @@ export { MemoryStorageDriver } from './storage/driver.js'
 export { InboxMailer, type InboxEntry } from './auth/inbox.js'
 export { LogBuffer, type LogEntry, type LogLevel } from './log-buffer.js'
 export { RealtimeEngine, type RealtimeSocketLike } from './realtime/engine.js'
-export { signJwt, verifyJwt, decodeJwt } from './jwt.js'
+export { signJwt, verifyJwt, decodeJwt, deriveApiKeys } from './jwt.js'
 export { FunctionsHandler, type EdgeFunction, type FunctionContext } from './functions/handler.js'
 export { generateTypes } from './gen-types.js'
 export { installDenoShim } from './functions/deno-shim.js'
@@ -188,13 +188,14 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     await failStartup(e)
   }
 
-  const now = Math.floor(Date.now() / 1000)
-  const tenYears = 10 * 365 * 24 * 3600
-  const anonKey = await signJwt({ iss: 'supabase', ref: 'tinbase', role: 'anon', iat: now, exp: now + tenYears }, jwtSecret)
-  const serviceRoleKey = await signJwt(
-    { iss: 'supabase', ref: 'tinbase', role: 'service_role', iat: now, exp: now + tenYears },
-    jwtSecret
-  )
+  // Dev keys are deterministic (Supabase-demo claims, fixed expiry): the same
+  // secret always yields the same keys, so with the default secret they are
+  // byte-identical to Supabase's well-known local demo keys and a .env.local
+  // can be committed and shared. Under NODE_ENV=production every start signs
+  // fresh, unique keys instead.
+  const isProduction =
+    typeof process !== 'undefined' && process.env?.NODE_ENV === 'production'
+  const { anonKey, serviceRoleKey } = await deriveApiKeys(jwtSecret, isProduction ? 'unique' : 'deterministic')
 
   const rest = new RestHandler(db, { exposedSchemas: config.dbSchemas, maxRows: config.maxRows })
   // With no custom mailer, capture auth emails in an in-memory inbox (viewable
