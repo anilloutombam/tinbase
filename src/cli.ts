@@ -28,7 +28,7 @@ const IS_BINARY = process.env.TINBASE_SINGLE_BINARY === '1'
 const NATIVE_SUPPORTED =
   (process.platform === 'darwin' || process.platform === 'linux') &&
   (process.arch === 'arm64' || process.arch === 'x64')
-import { signJwt } from './jwt.js'
+import { deriveApiKeys } from './jwt.js'
 import { DEFAULT_JWT_SECRET } from './types.js'
 
 /** Parsed command + flags for one CLI invocation. */
@@ -296,14 +296,16 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'keys') {
-    const now = Math.floor(Date.now() / 1000)
-    const exp = now + 10 * 365 * 24 * 3600
-    console.log('anon key:')
-    console.log(await signJwt({ iss: 'supabase', ref: 'tinbase', role: 'anon', iat: now, exp }, opts.jwtSecret))
-    console.log('\nservice_role key:')
-    console.log(
-      await signJwt({ iss: 'supabase', ref: 'tinbase', role: 'service_role', iat: now, exp }, opts.jwtSecret)
+    // Same derivation as the server: deterministic in dev (stable across runs,
+    // demo-identical with the default secret), unique per run in production.
+    const { anonKey, serviceRoleKey } = await deriveApiKeys(
+      opts.jwtSecret,
+      process.env.NODE_ENV === 'production' ? 'unique' : 'deterministic'
     )
+    console.log('anon key:')
+    console.log(anonKey)
+    console.log('\nservice_role key:')
+    console.log(serviceRoleKey)
     return
   }
 
@@ -421,6 +423,15 @@ async function main(): Promise<void> {
 
           anon key: ${backend.anonKey}
   service_role key: ${backend.serviceRoleKey}
+
+  ${
+    process.env.NODE_ENV === 'production'
+      ? 'Keys are unique per start (NODE_ENV=production). For your env:'
+      : 'Same keys every start - safe to commit. Drop into .env.local:'
+  }
+    SUPABASE_URL=${server.url}
+    SUPABASE_ANON_KEY=${backend.anonKey}
+    SUPABASE_SERVICE_ROLE_KEY=${backend.serviceRoleKey}
 
   Use with supabase-js:
     const supabase = createClient('${server.url}', '<anon key>')

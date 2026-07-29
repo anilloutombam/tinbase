@@ -31,6 +31,20 @@ npx tinbase start
 #   service_role key: eyJ...
 ```
 
+The keys are the same on every start and on every machine (they're the
+well-known Supabase local-dev demo keys), so you can commit them straight into
+a shared `.env.local` - same as `supabase start`:
+
+```bash
+# .env.local - safe to commit, identical for every teammate
+SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+```
+
+With a custom `--jwt-secret` the keys are still deterministic (stable per
+secret); under `NODE_ENV=production` every start signs fresh, unique keys.
+
 Point the ordinary supabase-js client at it:
 
 ```ts
@@ -54,7 +68,7 @@ supabase
 tinbase start      # boot the server (applies pending migrations first)
 tinbase migrate    # apply pending migrations and exit
 tinbase status     # list applied migrations
-tinbase keys       # print anon / service_role keys
+tinbase keys       # print anon / service_role keys (deterministic in dev, unique when NODE_ENV=production)
 tinbase gen types  # print a TypeScript Database type for the schema
 tinbase db reset   # wipe the database + storage, re-run migrations and seed
 tinbase db diff    # DDL for schema changes not yet in migrations (-f <name> to save one)
