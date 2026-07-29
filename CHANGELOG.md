@@ -4,6 +4,27 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.11.1]
+
+### Fixed
+- **The package bundles for the browser again.** 0.11.0 added a static
+  `import { AsyncLocalStorage } from 'node:async_hooks'` to `deno-shim.ts`, which
+  is reachable from the package root — so every app that bundles tinbase for the
+  browser (in-page pg-mem previews) failed to build, with client bundlers
+  (Turbopack, Metro) refusing to resolve a Node-only builtin: "the chunking
+  context does not support external modules". `async_hooks` is now loaded at
+  runtime through `process.getBuiltinModule`, which is synchronous and ESM-safe
+  and leaves no import statement for a bundler to see. `Deno.cwd()` is guarded
+  the same way, so it no longer throws `ReferenceError` where there is no
+  `process`.
+
+  On Node this is unchanged: `AsyncLocalStorage` still scopes each invocation's
+  function env, so interleaved invocations stay isolated. Where
+  `getBuiltinModule` is unavailable the shim falls back to a promise-scoped
+  store — the env stays bound across awaits for a whole invocation, but
+  concurrent invocations are not isolated from one another. That is the right
+  trade for browser previews, which invoke one function at a time.
+
 ## [0.11.0]
 
 ### Added
