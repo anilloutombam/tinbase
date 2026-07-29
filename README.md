@@ -256,3 +256,18 @@ tinbase was built for [lifo](https://lifo.sh) - a project that maps Linux APIs i
 
 1. Every service is a pure fetch handler, and the `wasm` engine is Postgres compiled to WASM (PGlite), so with it the whole backend can run **in-process inside a browser tab**.
 2. The same design makes a lighter Supabase for local dev and self-contained apps - `npx tinbase start` instead of Docker Compose.
+
+## Related projects
+
+tinbase is built by the team behind **[RapidNative](https://rapidnative.com)** — AI that
+generates production-ready React Native apps and UIs from a prompt — alongside these
+open-source tools:
+
+| Project | What it is |
+| --- | --- |
+| [RapidNative](https://rapidnative.com) | AI that generates production-ready React Native apps and UIs from a prompt |
+| [Lifo](https://lifo.sh) | Linux APIs in the browser — real dev tooling with no VM and no container |
+| [ORCHD](https://rapidnative.github.io/orchd) | A multi-tenant workload orchestrator — per-tenant workloads that sleep when idle and wake on the next request |
+| [jetplane](https://sanketsahu.github.io/jetplane) | A Metro plugin and a thin dev server for Expo — many dev environments per machine |
+
+See them all on [rapidnative.com/open-source](https://www.rapidnative.com/open-source).

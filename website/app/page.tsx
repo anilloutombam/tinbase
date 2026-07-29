@@ -101,6 +101,12 @@ const RELATED = [
     desc: 'A Metro plugin and a lightweight dev server for Expo & React Native — many dev environments per machine.',
   },
   {
+    name: 'ORCHD',
+    href: 'https://rapidnative.github.io/orchd',
+    logo: 'https://rapidnative.github.io/orchd/logo.svg',
+    desc: 'A multi-tenant workload orchestrator — every tenant gets a hostname, sleeps when idle, wakes in about a second.',
+  },
+  {
     name: 'RapidNative',
     href: 'https://rapidnative.com',
     logo: '/logos/rapidnative.svg',
@@ -300,7 +306,7 @@ export default function Home() {
             <p className="mt-1 max-w-2xl text-sm text-subtle">
               tinbase is built by the makers of these open-source tools and products.
             </p>
-            <div className="mt-6 grid gap-3 sm:grid-cols-3">
+            <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               {RELATED.map((p) => (
                 <a
                   key={p.name}
