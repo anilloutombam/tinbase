@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next'
 import { Geist, Geist_Mono } from 'next/font/google'
+import { PHBanner } from '@/components/ph-banner'
 import './globals.css'
 
 const sans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] })
@@ -98,10 +99,18 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               "(function(){try{var t=localStorage.getItem('theme');var d=t?t==='dark':matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.classList.toggle('dark',d);}catch(e){document.documentElement.classList.add('dark');}})();",
           }}
         />
+        {/* hide the Product Hunt banner before paint if previously dismissed */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html:
+              "(function(){try{if(localStorage.getItem('ph-banner-dismissed'))document.documentElement.setAttribute('data-ph-dismissed','1');}catch(e){}})();",
+          }}
+        />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{ __html: JSON.stringify(JSON_LD) }}
         />
+        <PHBanner />
         {children}
       </body>
     </html>
