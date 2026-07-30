@@ -68,6 +68,12 @@ body {
   font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
+/* Product Hunt banner: hidden pre-paint (and on dismiss) via a data attribute
+   on <html>, set by the inline script in layout.tsx and the dismiss button. */
+html[data-ph-dismissed="1"] .ph-banner {
+  display: none;
+}
+
 /* shiki dual theme: light colors are inline; swap to dark under .dark */
 .shiki,
 .shiki span {
