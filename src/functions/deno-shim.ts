@@ -14,19 +14,59 @@
  * a function using those needs a bundling step. Functions that stick to Web
  * APIs (fetch/Request/Response) + Deno.serve/Deno.env work as-is.
  */
-import { AsyncLocalStorage } from 'node:async_hooks'
-
 type DenoHandler = (req: Request) => Response | Promise<Response>
 
 const captured: { handler?: DenoHandler } = {}
 
+type FunctionEnv = Record<string, string>
+
+interface EnvStore {
+  run<T>(env: FunctionEnv, fn: () => Promise<T>): Promise<T>
+  getStore(): FunctionEnv | undefined
+}
+
 // The Deno global is installed once per process, but each backend (and each
-// in-flight invocation) has its own function env. An AsyncLocalStorage scopes
-// the env to the invocation's async context, so it stays correct across awaits
-// even when two invocations interleave on the event loop - a module-global that
-// was swapped around `await` would let a later call overwrite an earlier call's
-// env mid-flight. A Deno.env read outside any invocation sees an empty env.
-const envStore = new AsyncLocalStorage<Record<string, string>>()
+// in-flight invocation) has its own function env. On Node an AsyncLocalStorage
+// scopes the env to the invocation's async context, so it stays correct across
+// awaits even when two invocations interleave on the event loop - a
+// module-global that was swapped around `await` would let a later call
+// overwrite an earlier call's env mid-flight.
+//
+// This module is reachable from the package root, which browser apps bundle to
+// run tinbase in-page (pg-mem previews) - so it must not statically import
+// `node:async_hooks`, a Node-only builtin that client bundlers refuse to
+// resolve. `process.getBuiltinModule` (Node >= 22.3, within our engines range)
+// loads it synchronously without an import statement bundlers can see. A
+// Deno.env read outside any invocation sees an empty env.
+function createEnvStore(): EnvStore {
+  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process
+  const hooks = proc?.getBuiltinModule?.('node:async_hooks') as typeof import('node:async_hooks') | undefined
+  if (hooks?.AsyncLocalStorage) return new hooks.AsyncLocalStorage<FunctionEnv>()
+
+  // Non-Node runtime: bind the env for the duration of the returned promise.
+  // Unlike AsyncLocalStorage this can't isolate interleaved invocations from
+  // each other, but browser previews invoke functions one at a time.
+  let current: FunctionEnv | undefined
+  return {
+    getStore: () => current,
+    run<T>(env: FunctionEnv, fn: () => Promise<T>): Promise<T> {
+      const prev = current
+      current = env
+      let result: Promise<T>
+      try {
+        result = fn()
+      } catch (e) {
+        current = prev
+        throw e
+      }
+      return Promise.resolve(result).finally(() => {
+        current = prev
+      })
+    },
+  }
+}
+
+const envStore = createEnvStore()
 
 /**
  * Run `fn` with the shim's Deno.env bound to `env`. The binding lives in an
@@ -68,7 +108,7 @@ export function installDenoShim(): void {
       toObject: () => ({ ...(envStore.getStore() ?? {}) }),
     },
     // enough of the surface that idiomatic functions don't crash on reference
-    cwd: () => process.cwd(),
+    cwd: () => (globalThis as { process?: { cwd?: () => string } }).process?.cwd?.() ?? '/',
     // a function must not be able to terminate the whole server; throw instead
     // of calling process.exit.
     exit: (code?: number) => {

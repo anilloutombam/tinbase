@@ -4,6 +4,54 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.11.1]
+
+### Fixed
+- **The package bundles for the browser again.** 0.11.0 added a static
+  `import { AsyncLocalStorage } from 'node:async_hooks'` to `deno-shim.ts`, which
+  is reachable from the package root — so every app that bundles tinbase for the
+  browser (in-page pg-mem previews) failed to build, with client bundlers
+  (Turbopack, Metro) refusing to resolve a Node-only builtin: "the chunking
+  context does not support external modules". `async_hooks` is now loaded at
+  runtime through `process.getBuiltinModule`, which is synchronous and ESM-safe
+  and leaves no import statement for a bundler to see. `Deno.cwd()` is guarded
+  the same way, so it no longer throws `ReferenceError` where there is no
+  `process`.
+
+  On Node this is unchanged: `AsyncLocalStorage` still scopes each invocation's
+  function env, so interleaved invocations stay isolated. Where
+  `getBuiltinModule` is unavailable the shim falls back to a promise-scoped
+  store — the env stays bound across awaits for a whole invocation, but
+  concurrent invocations are not isolated from one another. That is the right
+  trade for browser previews, which invoke one function at a time.
+
+## [0.11.0]
+
+### Added
+- **Local dev API keys are deterministic, so a `.env.local` can be committed.**
+  The anon and `service_role` keys were signed with `iat` = now, so every start
+  on every machine produced different keys — nothing that reads them could be
+  checked in, and each teammate had to copy their own pair out of the start
+  banner. Dev keys are now signed with fixed claims (`iss: "supabase-demo"`,
+  `exp: 1983812996`), which makes them stable across restarts and machines and,
+  with the default secret, byte-identical to Supabase's well-known local demo
+  keys — the same property `supabase start` has. The start banner prints a
+  ready-to-copy `.env.local` block.
+- `deriveApiKeys(jwtSecret, mode)` is exported from the package root, alongside
+  the `DEMO_KEY_EXP` expiry claim. Both `createBackend` and `tinbase keys` go
+  through it, so the CLI and the server can no longer disagree about what a
+  given secret's keys are.
+
+### Changed
+- **Dev key values changed, and the claims they carry changed with them.** A
+  custom `--jwt-secret` still yields deterministic keys (stable per secret), but
+  in deterministic mode the claims are `iss: "supabase-demo"` with no `ref` and
+  no `iat`, where they were previously `iss: "supabase"`, `ref: "tinbase"`, plus
+  `iat`/`exp` ten years out. Anything that pinned a literal key string or
+  asserted on those claims needs its expected value refreshed. Under
+  `NODE_ENV=production` nothing changes: every start signs fresh, unique keys
+  with the old claim shape.
+
 ## [0.10.2]
 
 ### Fixed
