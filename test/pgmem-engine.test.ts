@@ -21,6 +21,27 @@ create table todos (
 -- these are unsupported by pg-mem and must be skipped, not crash the migration
 alter table todos enable row level security;
 create policy own on todos for all to authenticated using (owner = auth.uid());
+
+-- numeric/int8 vs text: pg-mem hands numeric and int8 back as strings (the
+-- node-postgres convention); the REST layer must re-serialize them as JSON
+-- numbers the way PostgREST does, while leaving numeric-LOOKING text alone.
+create table athletes (
+  id text primary key,
+  name text,
+  score numeric,
+  scouts int8,
+  zip text
+);
+create table sessions (
+  id text primary key,
+  athlete_id text references athletes(id),
+  velocity numeric
+);
+-- Seeded via SQL literals, like a project's seed.sql: THIS is the path where
+-- pg-mem produces numeric-as-string. Rows inserted through the REST API keep
+-- their JSON-number values, so they can't catch the regression on their own.
+insert into athletes (id, name, score, scouts, zip)
+values ('seeded', 'From Seed', 97.1, 21, '02134');
 `
 
 let backend: TinbaseBackend
@@ -88,5 +109,56 @@ describe('pg-mem engine (lite / preview)', () => {
     const { data, error } = await supabase.auth.signUp({ email: 'pm@example.com', password: 'password123' })
     expect(error).toBeNull()
     expect(data.session?.access_token).toBeTruthy()
+  })
+
+  // Regression: numeric/int8 came back as strings ("98.4"), so app code doing
+  // `athlete.score.toFixed(1)` crashed in preview while working on Supabase.
+  describe('numeric JSON serialization (PostgREST parity)', () => {
+    it('read returns numeric and int8 as JSON numbers, numeric-looking text as string', async () => {
+      await supabase
+        .from('athletes')
+        .insert({ id: 'a1', name: 'Marcus', score: 98.4, scouts: 14, zip: '02134' })
+      const { data, error } = await supabase.from('athletes').select().eq('id', 'a1').single()
+      expect(error).toBeNull()
+      expect((data as any).score).toBe(98.4)
+      expect((data as any).scouts).toBe(14)
+      expect((data as any).zip).toBe('02134') // text stays text
+    })
+
+    it('SQL-seeded rows (the seed.sql path) read back as numbers', async () => {
+      const { data, error } = await supabase.from('athletes').select().eq('id', 'seeded').single()
+      expect(error).toBeNull()
+      expect((data as any).score).toBe(97.1)
+      expect((data as any).scouts).toBe(21)
+      expect((data as any).zip).toBe('02134')
+    })
+
+    it('mutation echo (insert ... select) returns numbers', async () => {
+      const { data, error } = await supabase
+        .from('athletes')
+        .insert({ id: 'a2', name: 'Jae', score: 91.2, scouts: 7 })
+        .select()
+        .single()
+      expect(error).toBeNull()
+      expect((data as any).score).toBe(91.2)
+      expect((data as any).scouts).toBe(7)
+    })
+
+    // Embedded reads (`select=*,sessions(*)`) don't run on pg-mem yet — the
+    // builder's correlated lateral subquery trips "Unknown alias" in the
+    // engine — so the recursive branch is pinned directly instead of
+    // end-to-end. (FK *introspection* does work: the PGRST200 this query used
+    // to return is gone; the remaining failure is SQL execution.)
+    it('coerceJsonNumbers recurses into embedded relation rows', async () => {
+      const { coerceJsonNumbers } = await import('../src/rest/handler.js')
+      const info = await backend.db.getSchemaInfo('public')
+      const rows = [
+        { id: 'a1', score: '98.4', zip: '02134', sessions: [{ id: 's1', velocity: '4.25' }] },
+      ]
+      coerceJsonNumbers(rows, 'athletes', info)
+      expect(rows[0].score).toBe(98.4)
+      expect(rows[0].zip).toBe('02134')
+      expect(rows[0].sessions[0].velocity).toBe(4.25)
+    })
   })
 })

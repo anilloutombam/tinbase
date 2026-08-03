@@ -349,20 +349,24 @@ export class Database {
       `select
          tc.constraint_name,
          tc.table_schema as src_schema, tc.table_name as src_table,
-         kcu.column_name as src_column,
-         ccu.table_schema as tgt_schema, ccu.table_name as tgt_table,
-         ccu.column_name as tgt_column,
-         kcu.ordinal_position as ordinal
+         src.column_name as src_column,
+         tgt.table_schema as tgt_schema, tgt.table_name as tgt_table,
+         tgt.column_name as tgt_column,
+         src.ordinal_position as ordinal
        from information_schema.table_constraints tc
-       join information_schema.key_column_usage kcu
-         on kcu.constraint_name = tc.constraint_name
-        and kcu.constraint_schema = tc.constraint_schema
-       join information_schema.constraint_column_usage ccu
-         on ccu.constraint_name = tc.constraint_name
-        and ccu.constraint_schema = tc.constraint_schema
+       join information_schema.referential_constraints rc
+         on rc.constraint_name = tc.constraint_name
+        and rc.constraint_schema = tc.constraint_schema
+       join information_schema.key_column_usage src
+         on src.constraint_name = tc.constraint_name
+        and src.constraint_schema = tc.constraint_schema
+       join information_schema.key_column_usage tgt
+         on tgt.constraint_name = rc.unique_constraint_name
+        and tgt.constraint_schema = rc.unique_constraint_schema
+        and tgt.ordinal_position = src.ordinal_position
        where tc.constraint_type = 'FOREIGN KEY'
-         and (tc.table_schema = $1 or ccu.table_schema = $1)
-       order by tc.constraint_name, kcu.ordinal_position`,
+         and (tc.table_schema = $1 or tgt.table_schema = $1)
+       order by tc.constraint_name, src.ordinal_position`,
       [schema]
     )
 
