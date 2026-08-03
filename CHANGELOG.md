@@ -4,6 +4,40 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.12.0]
+
+### Added
+- **`POST /auth/v1/admin/generate_link`** (`supabase.auth.admin.generateLink()`),
+  which previously answered 404. It mints a link and OTP and returns them
+  instead of emailing them, so a caller can deliver or redeem them itself. That
+  is what makes programmatic session minting work: `generateLink()` then
+  `verifyOtp()` yields a session with no password and no email round trip, which
+  is the usual shape for an e2e test harness. No mail is sent, matching GoTrue.
+
+  Supported types: `signup`, `invite`, `magiclink`, `recovery`. The response is
+  flat (user fields alongside `action_link`, `email_otp`, `hashed_token`,
+  `redirect_to`, `verification_type`), which is what supabase-js expects before
+  it splits the body into `{ user, properties }`. Thanks to @itsacoyote for the
+  report (#77).
+
+### Fixed
+- **`/auth/v1/verify` accepts `token_hash`, not just `token`.** supabase-js sends
+  `token_hash` for `verifyOtp({ token_hash })`, which is the shape
+  `generateLink` feeds it, so that call previously failed validation with
+  "token is required". tinbase stores one-time tokens verbatim rather than
+  hashing them, so the two keys name the same opaque string.
+- **`signup` and `invite` verification links are redeemable.** Both `verify`
+  paths now resolve a verification type to the stored `token_type` rows through
+  one shared helper; `signup` and `invite` previously matched no row and always
+  failed. `recovery` stays scoped to recovery tokens, so a login token still
+  cannot mint a password-reset session.
+
+### Internal
+- CI builds before running tests. The CLI tests spawn `dist/cli.js` and returned
+  early when it was absent, which counted as passing, so those cases never ran
+  in CI and reported green regardless. They now report as skipped if the build
+  is missing, and CI emits rather than type-checking only, so they actually run.
+
 ## [0.11.3]
 
 ### Fixed
