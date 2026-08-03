@@ -43,7 +43,11 @@ interface CliOptions {
   host: string
   /** project directory containing supabase/ */
   dir: string
-  /** database data directory; undefined for in-memory (`--memory`) */
+  /**
+   * Data directory as explicitly requested via `--data-dir`, or undefined to
+   * use the engine's default. Read through {@link resolveDataDir} rather than
+   * directly - the default is engine-dependent.
+   */
   dataDir: string | undefined
   /** directory for storage object bytes */
   storageDir: string
@@ -111,9 +115,28 @@ function parseArgs(argv: string[]): CliOptions {
       process.exit(1)
     }
   }
-  if (!opts.dataDir && !opts.memory) opts.dataDir = join(opts.dir, '.tinbase', 'db')
   if (!opts.storageDir) opts.storageDir = join(opts.dir, '.tinbase', 'storage')
   return opts
+}
+
+/**
+ * The data directory the selected engine actually uses, or undefined when there
+ * is no directory to speak of (`--memory`, `--database-url`, or the in-memory
+ * pgmem subset).
+ *
+ * The engines keep their clusters apart - native embedded Postgres in
+ * `.tinbase/pgdata`, PGlite in `.tinbase/db` - so the default is
+ * engine-dependent and every command has to agree on it. Resolving it here, in
+ * one place, is what keeps `db reset` wiping the directory `start` later
+ * reopens: when reset defaulted on its own it wiped and rebuilt `.tinbase/db`
+ * while native `start` kept serving `.tinbase/pgdata`, so a reset reported
+ * success without touching the live database (#76). An explicit `--data-dir`
+ * wins for either engine; it used to be silently ignored by the native one.
+ */
+function resolveDataDir(opts: CliOptions): string | undefined {
+  if (opts.memory || opts.databaseUrl || opts.engine === 'pgmem') return undefined
+  if (opts.dataDir) return opts.dataDir
+  return join(opts.dir, '.tinbase', opts.engine === 'native' ? 'pgdata' : 'db')
 }
 
 /** Optional webhooks config at supabase/webhooks.json: [{ table, events?, url, headers? }]. */
@@ -148,7 +171,8 @@ Options:
   -p, --port <n>        port to listen on (default 54321; also TINBASE_PORT/PORT env)
       --host <host>     host to bind (default 127.0.0.1)
       --dir <path>      project directory containing supabase/ (default cwd)
-      --data-dir <path> PGlite data directory (default <dir>/.tinbase/db)
+      --data-dir <path> database data directory (default <dir>/.tinbase/pgdata
+                        for the native engine, <dir>/.tinbase/db for wasm)
       --storage-dir <p> storage files directory (default <dir>/.tinbase/storage)
       --jwt-secret <s>  JWT secret (or TINBASE_JWT_SECRET env var)
       --memory          in-memory database (no persistence, wasm engine only)
@@ -169,13 +193,11 @@ async function main(): Promise<void> {
   if (opts.command === 'db' && opts.positionals[0] === 'diff') {
     // `tinbase db diff [-f name]` - DDL for schema changes not yet in migrations
     const project = await loadSupabaseProject(opts.dir)
-    const nativeLive =
-      opts.engine === 'native'
-        ? await createNativeEngine({ dataDir: join(opts.dir, '.tinbase', 'pgdata') })
-        : undefined
+    const liveDataDir = resolveDataDir(opts)
+    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
     const ddl = await computeDbDiff({
       liveEngine: nativeLive,
-      liveDataDir: opts.engine === 'native' ? undefined : join(opts.dir, '.tinbase', 'db'),
+      liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
       migrations: project.migrations,
       makeShadowEngine:
         opts.engine === 'native' ? () => createNativeEngine({ dataDir: shadowNativeDataDir() }) : undefined,
@@ -201,13 +223,11 @@ async function main(): Promise<void> {
     // `tinbase db pull [name]` - write the current schema delta as a migration
     // and record it as already applied (so `start` won't re-run it)
     const project = await loadSupabaseProject(opts.dir)
-    const nativeLive =
-      opts.engine === 'native'
-        ? await createNativeEngine({ dataDir: join(opts.dir, '.tinbase', 'pgdata') })
-        : undefined
+    const liveDataDir = resolveDataDir(opts)
+    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
     const res = await pullSchema({
       liveEngine: nativeLive,
-      liveDataDir: opts.engine === 'native' ? undefined : join(opts.dir, '.tinbase', 'db'),
+      liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
       migrations: project.migrations,
       makeShadowEngine:
         opts.engine === 'native' ? () => createNativeEngine({ dataDir: shadowNativeDataDir() }) : undefined,
@@ -225,11 +245,11 @@ async function main(): Promise<void> {
   if (opts.command === 'inspect') {
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
-    const engine =
-      opts.engine === 'native' ? await createNativeEngine({ dataDir: join(opts.dir, '.tinbase', 'pgdata') }) : undefined
+    const inspectDataDir = resolveDataDir(opts)
+    const engine = opts.engine === 'native' ? await createNativeEngine({ dataDir: inspectDataDir! }) : undefined
     const backend = await createBackend({
       engine,
-      dataDir: opts.engine === 'native' ? undefined : join(opts.dir, '.tinbase', 'db'),
+      dataDir: opts.engine === 'native' ? undefined : inspectDataDir,
       migrations: project.migrations,
     })
     const rows = await inspectDb(backend.db, 'public')
@@ -253,18 +273,20 @@ async function main(): Promise<void> {
       process.exit(1)
     }
     // `tinbase db reset` - wipe data + storage and re-run migrations + seed fresh
-    const dataDir = opts.dataDir ?? join(opts.dir, '.tinbase', opts.engine === 'native' ? 'pgdata' : 'db')
+    const dataDir = resolveDataDir(opts)
     const storageDir = opts.storageDir || join(opts.dir, '.tinbase', 'storage')
-    await rm(dataDir, { recursive: true, force: true })
+    if (dataDir) await rm(dataDir, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })
     console.log('  wiped database and storage')
 
     const project = await loadSupabaseProject(opts.dir)
     const engine =
       opts.engine === 'native'
-        ? await createNativeEngine({ dataDir, log: (m) => console.log(`  ${m}`) })
-        : undefined
-    if (opts.engine !== 'native') await mkdir(dataDir, { recursive: true })
+        ? await createNativeEngine({ dataDir: dataDir!, log: (m) => console.log(`  ${m}`) })
+        : opts.engine === 'pgmem'
+          ? await createPgmemEngine()
+          : undefined
+    if (opts.engine === 'wasm' && dataDir) await mkdir(dataDir, { recursive: true })
     await mkdir(storageDir, { recursive: true })
     const backend = await createBackend({
       engine,
@@ -314,7 +336,10 @@ async function main(): Promise<void> {
   const functions = await loadFunctions(opts.dir, cfg.functions)
   const functionEnv = await loadFunctionEnv(opts.dir)
   const webhooks = loadWebhooks(opts.dir)
-  if (opts.dataDir) await mkdir(opts.dataDir, { recursive: true })
+  const dataDir = resolveDataDir(opts)
+  // The native engine initializes its own cluster directory; only PGlite needs
+  // the directory to exist up front.
+  if (dataDir && opts.engine === 'wasm') await mkdir(dataDir, { recursive: true })
   await mkdir(opts.storageDir, { recursive: true })
 
   // --database-url takes over engine selection: createBackend builds the
@@ -323,7 +348,7 @@ async function main(): Promise<void> {
     ? undefined
     : opts.engine === 'native'
       ? await createNativeEngine({
-          dataDir: join(opts.dir, '.tinbase', 'pgdata'),
+          dataDir: dataDir!,
           log: (msg) => console.log(`  ${msg}`),
         })
       : opts.engine === 'pgmem'
@@ -358,7 +383,7 @@ async function main(): Promise<void> {
   const backend = await createBackend({
     engine,
     databaseUrl: opts.databaseUrl,
-    dataDir: opts.databaseUrl || opts.memory ? undefined : opts.dataDir,
+    dataDir: opts.engine === 'native' ? undefined : dataDir,
     jwtSecret: opts.jwtSecret,
     // config.toml's site_url is what a real project uses for emailed links and
     // redirects; fall back to the bound address when it's not set. (The server
@@ -414,7 +439,7 @@ async function main(): Promise<void> {
 
            API URL: ${server.url}
           Admin UI: ${server.url}/_/${backend.inbox ? `\n       Email inbox: ${server.url}/inbox` : ''}
-            Engine: ${opts.engine === 'native' ? 'native postgres' : opts.engine === 'pgmem' ? 'pg-mem (in-memory, lite)' : `PGlite (${opts.memory ? 'in-memory' : opts.dataDir})`}
+            Engine: ${opts.engine === 'native' ? `native postgres (${dataDir})` : opts.engine === 'pgmem' ? 'pg-mem (in-memory, lite)' : `PGlite (${opts.memory ? 'in-memory' : dataDir})`}
            Storage: ${opts.storageDir}
         Migrations: ${project.migrations.length} file(s)
          Functions: ${functions.size > 0 ? [...functions.keys()].join(', ') : 'none'}
