@@ -9,6 +9,12 @@ import { createNativeEngine } from '../src/node/native/engine.js'
 // Exercises `tinbase db reset` via the built CLI, then inspects the wasm data dir.
 const CLI = join(process.cwd(), 'dist', 'cli.js')
 
+// These spawn the built CLI, so they need `tsc` to have emitted dist first.
+// Reported as *skipped* rather than silently returning early: as an early
+// return they counted as passing, so when CI ran `tsc --noEmit` and left no
+// dist, the whole file looked green while testing nothing.
+const BUILT = existsSync(CLI)
+
 const NATIVE_SUPPORTED =
   (process.platform === 'darwin' || process.platform === 'linux') && (process.arch === 'arm64' || process.arch === 'x64')
 
@@ -20,12 +26,8 @@ function project(): string {
   return dir
 }
 
-describe('cli db reset', () => {
+describe.skipIf(!BUILT)('cli db reset', () => {
   it('wipes data and re-applies migrations + seed', { timeout: 30000 }, () => {
-    if (!existsSync(CLI)) {
-      // requires the built CLI; skip if dist isn't present
-      return
-    }
     const dir = project()
     const run = (...args: string[]) => execFileSync('node', [CLI, ...args, '--dir', dir], { encoding: 'utf8' })
 
@@ -48,7 +50,6 @@ describe('cli db reset', () => {
   // this entirely, so this checks persisted state.
   describe.skipIf(!NATIVE_SUPPORTED)('native engine data dir', () => {
     it('reset wipes the same database the other commands use', { timeout: 120000 }, async () => {
-      if (!existsSync(CLI)) return
       const dir = project()
       const run = (...args: string[]) =>
         execFileSync('node', [CLI, ...args, '--dir', dir, '--engine', 'native'], { encoding: 'utf8' })
@@ -74,7 +75,6 @@ describe('cli db reset', () => {
     })
 
     it('honors an explicit --data-dir instead of silently ignoring it', { timeout: 120000 }, () => {
-      if (!existsSync(CLI)) return
       const dir = project()
       const custom = join(dir, 'custom-pg')
       execFileSync('node', [CLI, 'migrate', '--dir', dir, '--engine', 'native', '--data-dir', custom], {
@@ -87,7 +87,6 @@ describe('cli db reset', () => {
   })
 
   it('unknown db subcommand exits non-zero', { timeout: 15000 }, () => {
-    if (!existsSync(CLI)) return
     const dir = project()
     let failed = false
     try {
