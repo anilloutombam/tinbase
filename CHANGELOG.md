@@ -4,6 +4,31 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.11.3]
+
+### Fixed
+- **`db reset` wipes the database the other commands actually use.** Argument
+  parsing defaulted the data directory to `.tinbase/db` unconditionally, which
+  made the engine-aware fallback inside `db reset` dead code. On the native
+  engine reset therefore wiped `.tinbase/db` — a directory native never uses —
+  initialized a *second* Postgres cluster there, applied migrations to it and
+  reported `reset complete`, while `start`, `migrate`, `status` and `inspect`
+  went on serving the untouched `.tinbase/pgdata`. A reset appeared to succeed
+  and changed nothing. Data-directory resolution now lives in one engine-aware
+  helper that every command shares, so they cannot drift apart again. Thanks to
+  @SpaleRuby for the report (#76).
+
+### Changed
+- **`--data-dir` is honored by the native engine.** It was silently ignored
+  there — `start` hardcoded `.tinbase/pgdata` — while `db reset` did respect it,
+  the same disagreement in the opposite direction. Passing `--data-dir` now
+  places the native cluster where you asked for every command. If you were
+  passing it to a native project and relying on it being ignored, the data
+  directory moves; the default (`.tinbase/pgdata` for native, `.tinbase/db` for
+  wasm) is unchanged.
+- A native or pgmem project no longer creates an unused, empty `.tinbase/db`
+  alongside its real data directory on every command.
+
 ## [0.11.2]
 
 ### Fixed
