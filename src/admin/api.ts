@@ -6,6 +6,7 @@
  */
 import { applyAuthSettingsPatch, saveAuthSettings, type AuthSettings } from '../auth/settings.js'
 import { statusForSqlState } from '../rest/errors.js'
+import { INTERNAL_TABLE_NAMES } from '../db/bootstrap.js'
 import { quoteIdent } from '../db/database.js'
 import type { Database } from '../db/database.js'
 import { signJwt } from '../jwt.js'
@@ -239,8 +240,18 @@ export class AdminApi {
     } catch {
       // engine without information_schema.views - treat everything as a table
     }
+    // pg-mem ignores the schema qualifier, so it reports tinbase's own auth.*,
+    // storage.* and supabase_migrations.* tables as though they were in public.
+    // They aren't addressable there (`select from public.users` errors, which is
+    // why they listed with an unknown row count), so they are phantom entries:
+    // drop them rather than showing 13 internal tables a user can't open. Only
+    // on the subset engine, and only for public - the real engines keep them in
+    // their own schemas, which the studio already lists separately.
+    const hideInternal = !!this.db.engine.minimalBootstrap && schema === 'public'
+
     const tables = []
     for (const t of info.tables.values()) {
+      if (hideInternal && INTERNAL_TABLE_NAMES.has(t.name)) continue
       // A single table whose count fails (e.g. an engine gap in an RLS policy's
       // correlated subquery on the pgmem preview engine) must not blank the whole
       // table list - fall back to an unknown count for just that table.

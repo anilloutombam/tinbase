@@ -6,6 +6,39 @@
  */
 
 /**
+ * Unqualified names of the tables the bootstraps create outside `public`
+ * (`auth.*`, `storage.*`, `supabase_migrations.*`, `realtime.*`).
+ *
+ * pg-mem ignores the schema qualifier, so on that engine `information_schema`
+ * reports all of these as living in `public` even though nothing can address
+ * them there - `select from public.users` errors, which is why the studio showed
+ * them with an unknown row count. This list lets the studio drop those phantom
+ * entries. Keep it in step with the `create table` statements below; a name
+ * missing here simply reappears in the studio's table list.
+ */
+export const INTERNAL_TABLE_NAMES: ReadonlySet<string> = new Set([
+  // auth
+  'users',
+  'refresh_tokens',
+  'sessions',
+  'one_time_tokens',
+  'identities',
+  'flow_state',
+  'mfa_factors',
+  'mfa_challenges',
+  'audit_log_entries',
+  'config',
+  // storage
+  'buckets',
+  'objects',
+  // supabase_migrations
+  'schema_migrations',
+  'seed_files',
+  // realtime
+  'messages',
+])
+
+/**
  * Reduced bootstrap for subset engines (pg-mem) that can't run plpgsql, RLS
  * policies, extensions, or LISTEN/NOTIFY. Just the schemas, core tables, and
  * SQL-language auth helpers needed for the REST + auth CRUD surface. No RLS is
