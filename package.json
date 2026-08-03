@@ -1,7 +1,7 @@
 {
   "name": "tinbase",
   "version": "0.12.0",
-  "description": "A Docker-free, Supabase-compatible local backend — real Postgres (embedded native or PGlite/WASM), wire-compatible with supabase-js.",
+  "description": "A Docker-free, Supabase-compatible local backend \u2014 real Postgres (embedded native or PGlite/WASM), wire-compatible with supabase-js.",
   "type": "module",
   "author": "Sanket Sahu",
   "license": "MIT",
@@ -62,6 +62,6 @@
   },
   "optionalDependencies": {
     "esbuild": "^0.28.0",
-    "pg-mem": "npm:@tinbase/pg-mem@^3.3.0"
+    "pg-mem": "npm:@tinbase/pg-mem@^3.4.0"
   }
 }
