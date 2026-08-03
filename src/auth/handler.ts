@@ -294,13 +294,21 @@ export class AuthHandler {
          where rt.token = $1`,
         [token]
       )
-      const row = res.rows[0] as { revoked: boolean; user_id: string } | undefined
+      const row = res.rows[0] as { revoked: boolean; user_id: string; session_id: string | null } | undefined
       if (!row || row.revoked) {
         return authError(400, 'refresh_token_not_found', 'Invalid Refresh Token: Refresh Token Not Found')
       }
+      // A logout deletes the session but leaves its refresh tokens revoked; if
+      // the session is gone, the refresh token must not resurrect it.
+      if (row.session_id) {
+        const live = await this.db.query(`select 1 from auth.sessions where id = $1`, [row.session_id])
+        if (live.rows.length === 0) {
+          return authError(400, 'refresh_token_not_found', 'Invalid Refresh Token: Refresh Token Not Found')
+        }
+      }
       await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where token = $1`, [token])
       const ures = await this.db.query(`select * from auth.users where id = $1`, [row.user_id])
-      return json(200, await this.sessionFor(ures.rows[0] as UserRow, token))
+      return json(200, await this.sessionFor(ures.rows[0] as UserRow, token, { sessionId: row.session_id ?? undefined }))
     }
 
     if (grantType === 'pkce') {
@@ -379,11 +387,38 @@ export class AuthHandler {
     return json(200, this.userJson(updated))
   }
 
+  /**
+   * POST /auth/v1/logout[?scope=global|local|others]
+   *
+   * Deleting the session rows is what makes the logout observable: the access
+   * token stays cryptographically valid, so `/user` has to be able to see that
+   * its session is gone. Refresh tokens are revoked alongside, as before.
+   */
   private async logout(req: Request): Promise<Response> {
     const user = await this.userFromBearer(req)
     if (user) {
-      await this.db.query(`update auth.refresh_tokens set revoked = true where user_id = $1`, [user.id])
-      await this.audit('logout', { actorId: user.id, actorEmail: user.email })
+      const scope = new URL(req.url).searchParams.get('scope') ?? 'global'
+      const current = await this.sessionIdFromBearer(req)
+      if (scope === 'local' && current) {
+        await this.db.query(`delete from auth.sessions where id = $1`, [current])
+        await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where session_id = $1`, [
+          current,
+        ])
+      } else if (scope === 'others' && current) {
+        await this.db.query(`delete from auth.sessions where user_id = $1 and id <> $2`, [user.id, current])
+        await this.db.query(
+          `update auth.refresh_tokens set revoked = true, updated_at = now()
+           where user_id = $1 and (session_id is null or session_id <> $2)`,
+          [user.id, current]
+        )
+      } else {
+        // global, and the fallback when a token carries no session to scope by
+        await this.db.query(`delete from auth.sessions where user_id = $1`, [user.id])
+        await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where user_id = $1`, [
+          user.id,
+        ])
+      }
+      await this.audit('logout', { actorId: user.id, actorEmail: user.email, traits: { scope } })
     }
     return new Response(null, { status: 204 })
   }
@@ -1017,13 +1052,47 @@ export class AuthHandler {
 
   // ── helpers ───────────────────────────────────────────────────────────
 
+  /**
+   * Resolve the bearer token to a user, rejecting tokens whose session has been
+   * logged out.
+   *
+   * A valid signature is not enough here: GoTrue's `/user` consults session
+   * state, which is the whole reason server-side code validates with
+   * `getUser(jwt)` instead of verifying the JWT locally - so that a logout takes
+   * effect immediately rather than at expiry.
+   *
+   * Only tokens that carry a `session_id` are subject to the check. Ones that
+   * don't (the studio's impersonation token, for instance) have no session to
+   * revoke and behave as before.
+   *
+   * Note this deliberately does not extend to REST: PostgREST validates the JWT
+   * signature and nothing else, so a logged-out token keeps working there until
+   * it expires, in real Supabase as much as here.
+   */
   private async userFromBearer(req: Request): Promise<UserRow | null> {
     const authz = req.headers.get('authorization') ?? ''
     if (!authz.toLowerCase().startsWith('bearer ')) return null
     const claims = await verifyJwt(authz.slice(7), this.config.jwtSecret)
     if (!claims?.sub) return null
+    const sessionId = (claims as { session_id?: unknown }).session_id
+    if (typeof sessionId === 'string' && sessionId) {
+      const live = await this.db.query(
+        `select 1 from auth.sessions where id = $1 and (not_after is null or not_after > now())`,
+        [sessionId]
+      )
+      if (live.rows.length === 0) return null
+    }
     const res = await this.db.query(`select * from auth.users where id = $1`, [claims.sub])
     return (res.rows[0] as UserRow) ?? null
+  }
+
+  /** The session_id claim on a request's bearer token, if it carries one. */
+  private async sessionIdFromBearer(req: Request): Promise<string | null> {
+    const authz = req.headers.get('authorization') ?? ''
+    if (!authz.toLowerCase().startsWith('bearer ')) return null
+    const claims = await verifyJwt(authz.slice(7), this.config.jwtSecret)
+    const sessionId = (claims as { session_id?: unknown } | null)?.session_id
+    return typeof sessionId === 'string' && sessionId ? sessionId : null
   }
 
   /** Shape a user row into the GoTrue user object supabase-js expects. */
@@ -1065,7 +1134,7 @@ export class AuthHandler {
   private async sessionFor(
     user: UserRow,
     parentToken?: string,
-    opts?: { aal?: string; amr?: { method: string; timestamp: number }[] }
+    opts?: { aal?: string; amr?: { method: string; timestamp: number }[]; sessionId?: string }
   ): Promise<Record<string, unknown>> {
     const now = Math.floor(Date.now() / 1000)
     // Cap the access-token lifetime at the session timebox so a timeboxed
@@ -1074,7 +1143,11 @@ export class AuthHandler {
       ? Math.min(this.config.jwtExpiry, this.config.sessionTimeboxSeconds)
       : this.config.jwtExpiry
     const expiresAt = now + lifetime
-    const sessionId = crypto.randomUUID()
+    // Refreshing keeps the same session: a refresh is not a new login, and
+    // minting a fresh id would strand the previous access token's session_id on
+    // a row nothing points at, so the outgoing token would be rejected the
+    // moment the client refreshed.
+    const sessionId = opts?.sessionId ?? crypto.randomUUID()
     const claims: JwtClaims = {
       iss: `${this.config.siteUrl}/auth/v1`,
       sub: user.id,
@@ -1093,6 +1166,17 @@ export class AuthHandler {
     }
     const accessToken = await signJwt(claims, this.config.jwtSecret)
     const refreshToken = randomToken(24)
+    // Record the session before handing out a token that references it, so
+    // /auth/v1/user can never see a valid-looking token with no session row.
+    await this.db.query(
+      `insert into auth.sessions (id, user_id, not_after) values ($1, $2, $3)
+       on conflict (id) do update set updated_at = now()`,
+      [
+        sessionId,
+        user.id,
+        this.config.sessionTimeboxSeconds ? new Date((now + this.config.sessionTimeboxSeconds) * 1000).toISOString() : null,
+      ]
+    )
     await this.db.query(
       `insert into auth.refresh_tokens (token, user_id, parent, session_id) values ($1, $2, $3, $4)`,
       [refreshToken, user.id, parentToken ?? null, sessionId]

@@ -144,21 +144,11 @@ describe('pg-mem engine (lite / preview)', () => {
       expect((data as any).scouts).toBe(7)
     })
 
-    // Embedded reads (`select=*,sessions(*)`) don't run on pg-mem yet — the
-    // builder's correlated lateral subquery trips "Unknown alias" in the
-    // engine — so the recursive branch is pinned directly instead of
-    // end-to-end. (FK *introspection* does work: the PGRST200 this query used
-    // to return is gone; the remaining failure is SQL execution.)
-    it('coerceJsonNumbers recurses into embedded relation rows', async () => {
-      const { coerceJsonNumbers } = await import('../src/rest/handler.js')
-      const info = await backend.db.getSchemaInfo('public')
-      const rows = [
-        { id: 'a1', score: '98.4', zip: '02134', sessions: [{ id: 's1', velocity: '4.25' }] },
-      ]
-      coerceJsonNumbers(rows, 'athletes', info)
-      expect(rows[0].score).toBe(98.4)
-      expect(rows[0].zip).toBe('02134')
-      expect(rows[0].sessions[0].velocity).toBe(4.25)
-    })
+    // The recursive case (numeric inside an embedded relation) is now covered in
+    // @tinbase/pg-mem, whose json builders do the conversion: it has a nested
+    // row_to_json/json_agg test. It can't be driven end-to-end from here anyway,
+    // since embedded reads don't run on pg-mem yet - the builder's correlated
+    // lateral subquery trips "Unknown alias" in the engine. FK *introspection*
+    // does work; the remaining failure is SQL execution.
   })
 })

@@ -14,6 +14,7 @@ import {
   type FilterCond,
   type LogicCond,
   type ParsedQuery,
+  type OrderTerm,
   type SelectEmbed,
   type SelectItem,
 } from './parse.js'
@@ -98,7 +99,7 @@ export class QueryBuilder {
     }
     const { exprs, innerConds } = this.buildSelectList(this.q.select, table, alias, [])
     const where = this.baseWhere(alias, innerConds)
-    const order = this.renderOrder([], alias)
+    const order = this.renderOrder([], alias, table)
     const limitOffset = this.renderLimitOffset('')
 
     const core = `select ${exprs.join(', ')} from ${this.qualify(table)} as ${quoteIdent(alias)}${where}${order}${limitOffset}`
@@ -146,7 +147,7 @@ export class QueryBuilder {
     const where = this.baseWhere(alias, [])
     const groupBy = groupExprs.length > 0 ? ` group by ${groupExprs.join(', ')}` : ''
     const body = `select ${selExprs.join(', ')} from ${this.qualify(table)} as ${quoteIdent(alias)}${where}${groupBy}`
-    const core = `${body}${this.renderOrder([], alias)}${this.renderLimitOffset('')}`
+    const core = `${body}${this.renderOrder([], alias, table)}${this.renderLimitOffset('')}`
     this.assertAllPathsConsumed()
     return {
       sql: `select coalesce(json_agg(row_to_json(_r)), ${AGG_EMPTY}) as body from (${core}) _r`,
@@ -321,20 +322,9 @@ export class QueryBuilder {
     // correlation + filters scoped to this embed path
     const conds: string[] = [...childInner]
     let fromClause: string
-    if (rel.type === 'to-one') {
+    if (rel.type === 'to-one' || rel.type === 'to-many') {
       fromClause = `${this.qualify(rel.targetTable)} as ${quoteIdent(childAlias)}`
-      rel.fk.srcColumns.forEach((src, i) => {
-        conds.push(
-          `${quoteIdent(childAlias)}.${quoteIdent(rel.fk.tgtColumns[i])} = ${quoteIdent(baseAlias)}.${quoteIdent(src)}`
-        )
-      })
-    } else if (rel.type === 'to-many') {
-      fromClause = `${this.qualify(rel.targetTable)} as ${quoteIdent(childAlias)}`
-      rel.fk.srcColumns.forEach((src, i) => {
-        conds.push(
-          `${quoteIdent(childAlias)}.${quoteIdent(src)} = ${quoteIdent(baseAlias)}.${quoteIdent(rel.fk.tgtColumns[i])}`
-        )
-      })
+      conds.push(...QueryBuilder.correlate(rel, baseAlias, childAlias))
     } else {
       const j = rel.junction!
       const jAlias = this.nextAlias()
@@ -357,7 +347,7 @@ export class QueryBuilder {
     }
 
     const where = conds.length > 0 ? ` where ${conds.join(' and ')}` : ''
-    const order = this.renderOrder(path, childAlias)
+    const order = this.renderOrder(path, childAlias, rel.targetTable)
     const limitOffset = this.renderLimitOffset(pathKey)
     const outName = embed.alias ?? embed.name
 
@@ -396,6 +386,25 @@ export class QueryBuilder {
     if (!t) return false
     const want = [...columns].sort().join(' ')
     return t.uniqueKeys.some((key) => key.length === columns.length && [...key].sort().join(' ') === want)
+  }
+
+  /**
+   * Conditions correlating an embedded target to its parent row. For `to-one`
+   * the fk lives on the base, for `to-many` on the target, so the two sides swap.
+   * Shared by the embed subquery and `order=relation(column)` so a change to one
+   * cannot silently order by a different join than it selects.
+   */
+  private static correlate(rel: Relationship, baseAlias: string, childAlias: string): string[] {
+    if (rel.type === 'to-one') {
+      return rel.fk.srcColumns.map(
+        (src, i) =>
+          `${quoteIdent(childAlias)}.${quoteIdent(rel.fk.tgtColumns[i])} = ${quoteIdent(baseAlias)}.${quoteIdent(src)}`
+      )
+    }
+    return rel.fk.srcColumns.map(
+      (src, i) =>
+        `${quoteIdent(childAlias)}.${quoteIdent(src)} = ${quoteIdent(baseAlias)}.${quoteIdent(rel.fk.tgtColumns[i])}`
+    )
   }
 
   private findRelationship(baseTable: string, embed: SelectEmbed): Relationship {
@@ -489,18 +498,61 @@ export class QueryBuilder {
     return node.negated ? `not ${joined}` : joined
   }
 
-  /** Render the `order by` clause for the terms scoped to the given embed path (`[]` = base). */
-  renderOrder(path: string[], alias: string): string {
+  /**
+   * Render the `order by` clause for the terms scoped to the given embed path
+   * (`[]` = base). `table` is the table `alias` refers to, needed only to resolve
+   * `order=relation(column)` terms; omit it where there is no relational context
+   * (an RPC result), and such a term will report that rather than mis-resolving.
+   */
+  renderOrder(path: string[], alias: string, table?: string): string {
     const pathKey = path.join('.')
     const terms = this.q.order.filter((o) => o.path.join('.') === pathKey)
     if (terms.length === 0) return ''
     const parts = terms.map((t) => {
-      let s = `${renderColumnExpr(alias, t.column)} ${t.asc ? 'asc' : 'desc'}`
+      let s = `${t.relation ? this.embeddedOrderExpr(t, alias, table) : renderColumnExpr(alias, t.column)} ${
+        t.asc ? 'asc' : 'desc'
+      }`
       if (t.nullsFirst === true) s += ' nulls first'
       if (t.nullsFirst === false) s += ' nulls last'
       return s
     })
     return ` order by ${parts.join(', ')}`
+  }
+
+  /**
+   * A correlated scalar subquery for `order=relation(column)`.
+   *
+   * Embeds are rendered as correlated subqueries rather than joins here, so
+   * ordering by one follows the same shape instead of restructuring the query
+   * into a LEFT JOIN the way PostgREST does. The result matches: exactly one
+   * value per base row, NULL where the related row is absent.
+   */
+  private embeddedOrderExpr(term: OrderTerm, baseAlias: string, table?: string): string {
+    const relation = term.relation!
+    if (!table) {
+      throw new ParseError(`cannot order by '${relation}(${term.column})' here: no embedded resources in this context`)
+    }
+    const rel = this.findRelationship(table, {
+      kind: 'embed',
+      name: relation,
+      hint: term.relationHint,
+      children: [],
+      inner: false,
+      spread: false,
+    })
+    // Ordering needs one value per base row. A to-many embed has many, so
+    // PostgREST rejects it too - say which relationship it was, since the same
+    // name can resolve either way depending on where the fk sits.
+    if (!rel.single) {
+      throw new ParseError(
+        `cannot order by '${relation}(${term.column})': ` +
+          `'${relation}' is a to-many relationship from '${table}', which has no single value per row`
+      )
+    }
+    const childAlias = this.nextAlias()
+    const conds = QueryBuilder.correlate(rel, baseAlias, childAlias)
+    const col = renderColumnExpr(childAlias, term.column)
+    return `(select ${col} from ${this.qualify(rel.targetTable)} as ${quoteIdent(childAlias)} where ${conds.join(' and ')} limit 1)`
   }
 
   /** Render `limit`/`offset` for the given path key (`''` = base); empty when neither is set. */
