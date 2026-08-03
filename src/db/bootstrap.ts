@@ -47,6 +47,17 @@ create table if not exists auth.refresh_tokens (
   updated_at timestamptz default now()
 );
 
+-- One row per live session, keyed by the access token's session_id claim. A
+-- logout deletes the row, which is what lets /auth/v1/user reject a token whose
+-- signature is still perfectly valid.
+create table if not exists auth.sessions (
+  id uuid primary key,
+  user_id uuid not null,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  not_after timestamptz
+);
+
 create table if not exists auth.one_time_tokens (
   id uuid primary key default gen_random_uuid(),
   user_id uuid,
@@ -288,6 +299,19 @@ create table if not exists auth.refresh_tokens (
 );
 
 create index if not exists refresh_tokens_user_id_idx on auth.refresh_tokens(user_id);
+
+-- One row per live session, keyed by the access token's session_id claim. A
+-- logout deletes the row, which is what lets /auth/v1/user reject a token whose
+-- signature is still perfectly valid.
+create table if not exists auth.sessions (
+  id uuid primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  not_after timestamptz
+);
+
+create index if not exists sessions_user_id_idx on auth.sessions(user_id);
 
 create table if not exists auth.one_time_tokens (
   id uuid primary key default gen_random_uuid(),

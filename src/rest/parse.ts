@@ -64,6 +64,15 @@ export interface OrderTerm {
   column: string
   asc: boolean
   nullsFirst?: boolean
+  /**
+   * Embedded resource to read `column` from, for PostgREST's
+   * `order=relation(column)` form (supabase-js `.order('relation(column)')`).
+   * Absent for an ordinary top-level column. Only to-one / one-to-one embeds can
+   * be ordered by, since anything else has no single value per base row.
+   */
+  relation?: string
+  /** disambiguating hint from `order=relation!hint(column)` */
+  relationHint?: string
 }
 
 /** The fully parsed query string, consumed by the QueryBuilder. */
@@ -207,9 +216,23 @@ function parseLogicTree(op: 'and' | 'or', raw: string, path: string[], negated: 
   return { kind: 'logic', path, op, negated, conditions }
 }
 
+/** `relation(column)` or `relation!hint(column)`, as used by `order=`. */
+const ORDER_RELATION_RE = /^([A-Za-z_][A-Za-z0-9_]*)(?:!([A-Za-z0-9_]+))?\(([^()]+)\)$/
+
 function parseOrderTerm(term: string, path: string[]): OrderTerm {
-  const parts = term.split('.')
-  const column = unquote(parts[0])
+  const parts = splitTopLevel(term, '.')
+  let column = unquote(parts[0])
+  let relation: string | undefined
+  let relationHint: string | undefined
+  // order=relation(column): ordering the current level by a to-one embedded
+  // column. Without this the whole "relation(column)" string was taken as a
+  // column name and reached Postgres verbatim, which failed as 42703.
+  const rel = ORDER_RELATION_RE.exec(parts[0])
+  if (rel) {
+    relation = rel[1]
+    relationHint = rel[2]
+    column = unquote(rel[3])
+  }
   let asc = true
   let nullsFirst: boolean | undefined
   for (const p of parts.slice(1)) {
@@ -219,7 +242,7 @@ function parseOrderTerm(term: string, path: string[]): OrderTerm {
     else if (p === 'nullslast') nullsFirst = false
     else throw new ParseError(`invalid order term: ${term}`)
   }
-  return { path, column, asc, nullsFirst }
+  return { path, column, asc, nullsFirst, relation, relationHint }
 }
 
 /** Split on a delimiter, ignoring delimiters inside parens and double quotes. */
