@@ -390,18 +390,29 @@ export class AuthHandler {
 
   // ── OTP / magic links / recovery ──────────────────────────────────────
 
-  private async issueToken(
+  /**
+   * Create-or-find the user for `email` and mint its one-time code + link token
+   * pair, replacing any live tokens of the same type.
+   *
+   * Shared by the email-sending flows ({@link issueToken}) and the admin
+   * `generate_link` endpoint, which needs the very same tokens but hands them
+   * back to the caller instead of mailing them. Keeping one implementation is
+   * what stops the two from disagreeing about expiry, replacement, or which
+   * `token_type` rows get written - a link that `verify` can't redeem is worse
+   * than no link at all.
+   */
+  private async mintOneTimeToken(
     email: string,
     tokenType: 'otp' | 'recovery',
-    createUser: boolean,
-    flavor: 'login' | 'confirm' = 'login'
-  ): Promise<Response> {
+    createUser: boolean
+  ): Promise<{ user: UserRow; code: string; linkToken: string } | { error: Response }> {
     const normalized = email.toLowerCase().trim()
     let res = await this.db.query(`select * from auth.users where email = $1`, [normalized])
     let user = res.rows[0] as UserRow | undefined
     if (!user) {
-      if (!createUser) return authError(422, 'otp_disabled', 'Signups not allowed for otp')
-      if (this.settings.disableSignup) return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
+      if (!createUser) return { error: authError(422, 'otp_disabled', 'Signups not allowed for otp') }
+      if (this.settings.disableSignup)
+        return { error: authError(422, 'signup_disabled', 'Signups not allowed for this instance') }
       res = await this.db.query(
         `insert into auth.users (aud, role, email, raw_app_meta_data, raw_user_meta_data)
          values ('authenticated', 'authenticated', $1, '{"provider":"email","providers":["email"]}', '{}')
@@ -419,6 +430,19 @@ export class AuthHandler {
        values ($1, $2, $3, $4, now() + $7::interval), ($1, $2, $5, $6, now() + $7::interval)`,
       [user.id, normalized, tokenType, code, tokenType === 'otp' ? 'magiclink' : tokenType, linkToken, expiry]
     )
+    return { user, code, linkToken }
+  }
+
+  private async issueToken(
+    email: string,
+    tokenType: 'otp' | 'recovery',
+    createUser: boolean,
+    flavor: 'login' | 'confirm' = 'login'
+  ): Promise<Response> {
+    const minted = await this.mintOneTimeToken(email, tokenType, createUser)
+    if ('error' in minted) return minted.error
+    const { code, linkToken } = minted
+    const normalized = email.toLowerCase().trim()
     const kind = tokenType === 'otp' ? 'magiclink' : tokenType
     const link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
     await this.config.mailer.send({
@@ -486,15 +510,35 @@ export class AuthHandler {
     return (ures.rows[0] as UserRow) ?? null
   }
 
+  /**
+   * The `one_time_tokens.token_type` rows a given verification type may redeem.
+   *
+   * A recovery (password-reset) token must be redeemed with type=recovery
+   * explicitly - never fold it into the default set, or a guessed login OTP
+   * could mint a recovery session. Everything else (`otp`, `signup`, `invite`,
+   * `email`, or absent) redeems the login pair, since those all mint the same
+   * otp+magiclink rows.
+   */
+  private static redeemTypes(type?: string): string[] {
+    if (type === 'recovery') return ['recovery']
+    if (type === 'magiclink') return ['magiclink']
+    return ['otp', 'magiclink']
+  }
+
   private async verifyToken(req: Request): Promise<Response> {
-    const body = (await req.json().catch(() => ({}))) as { type?: string; email?: string; token?: string }
-    if (!body.token) return authError(400, 'validation_failed', 'token is required')
-    // A recovery (password-reset) token must be redeemed with type=recovery
-    // explicitly - never fold it into the default set, or a guessed login OTP
-    // could mint a recovery session.
-    const types =
-      body.type === 'recovery' ? ['recovery'] : body.type === 'magiclink' ? ['magiclink'] : ['otp', 'magiclink']
-    const user = await this.redeem(body.token, types, body.email)
+    const body = (await req.json().catch(() => ({}))) as {
+      type?: string
+      email?: string
+      token?: string
+      token_hash?: string
+    }
+    // supabase-js sends `token_hash` for verifyOtp({ token_hash }) - the shape
+    // `admin.generateLink` feeds - and `token` for verifyOtp({ email, token }).
+    // Accept either; ours are opaque one-time tokens, so the two are the same
+    // string here.
+    const token = body.token ?? body.token_hash
+    if (!token) return authError(400, 'validation_failed', 'token is required')
+    const user = await this.redeem(token, AuthHandler.redeemTypes(body.type), body.email)
     if (!user) return authError(403, 'otp_expired', 'Token has expired or is invalid')
     return json(200, await this.sessionFor(user))
   }
@@ -511,7 +555,7 @@ export class AuthHandler {
       this.config.uriAllowList,
       this.config.enforceRedirectAllowList
     )
-    const user = await this.redeem(token, [type])
+    const user = await this.redeem(token, AuthHandler.redeemTypes(type))
     if (!user) {
       return new Response(null, { status: 303, headers: { location: `${redirectTo}#error=access_denied&error_code=otp_expired` } })
     }
@@ -608,7 +652,95 @@ export class AuthHandler {
     if (idMatch && method === 'DELETE') {
       return await this.eraseUser(idMatch[1])
     }
+    if (path === 'admin/generate_link' && method === 'POST') {
+      return await this.generateLink(req)
+    }
     return authError(404, 'not_found', `unknown admin endpoint`)
+  }
+
+  /**
+   * POST /auth/v1/admin/generate_link - mint a link/OTP and return it instead of
+   * emailing it, so a caller (typically an e2e test harness) can deliver or
+   * redeem it itself. No mail is sent, matching GoTrue.
+   *
+   * The response is deliberately flat - user fields alongside `action_link`,
+   * `email_otp`, `hashed_token`, `redirect_to` and `verification_type` - because
+   * supabase-js splits that shape into `{ user, properties }` client-side. A
+   * nested response would leave `data.properties` undefined.
+   *
+   * `hashed_token` is the same opaque one-time token the emailed link carries;
+   * tinbase stores one-time tokens verbatim rather than hashing them, so there
+   * is nothing to un-hash and `verifyOtp({ token_hash })` redeems it directly.
+   */
+  private async generateLink(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      type?: string
+      email?: string
+      password?: string
+      data?: Record<string, unknown>
+      redirect_to?: string
+    }
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const type = body.type ?? 'magiclink'
+
+    // email_change_* would have to mint a token against a pending new address,
+    // which needs the email-change plumbing this handler doesn't have yet. Say
+    // so rather than returning a link that verifies as a plain login.
+    if (type === 'email_change_current' || type === 'email_change_new') {
+      return authError(400, 'validation_failed', `generate_link type "${type}" is not supported yet`)
+    }
+    if (!['signup', 'invite', 'magiclink', 'recovery'].includes(type)) {
+      return authError(400, 'validation_failed', `unsupported generate_link type: ${type}`)
+    }
+
+    // recovery is a reset for an existing account; the other three are the
+    // account-creating flows, mirroring how signup/otp already behave.
+    const tokenType = type === 'recovery' ? 'recovery' : 'otp'
+    const minted = await this.mintOneTimeToken(body.email, tokenType, type !== 'recovery')
+    if ('error' in minted) return minted.error
+    let { user } = minted
+    const { code, linkToken } = minted
+
+    // Optional extras GoTrue accepts on the signup/invite flows.
+    if (body.password || body.data) {
+      const sets: string[] = []
+      const params: unknown[] = []
+      if (body.password) {
+        params.push(await hashPassword(body.password))
+        sets.push(`encrypted_password = $${params.length}`)
+      }
+      if (body.data) {
+        params.push(JSON.stringify(body.data))
+        sets.push(`raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb) || $${params.length}::jsonb`)
+      }
+      params.push(user.id)
+      const res = await this.db.query(
+        `update auth.users set ${sets.join(', ')}, updated_at = now() where id = $${params.length} returning *`,
+        params
+      )
+      user = (res.rows[0] as UserRow) ?? user
+    }
+
+    const redirectTo = resolveRedirect(
+      body.redirect_to,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    const actionLink =
+      `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${type}` +
+      `&redirect_to=${encodeURIComponent(redirectTo)}`
+
+    await this.audit('generate_link', { actorId: user.id, actorEmail: user.email, traits: { type } })
+
+    return json(200, {
+      ...this.userJson(user),
+      action_link: actionLink,
+      email_otp: code,
+      hashed_token: linkToken,
+      redirect_to: redirectTo,
+      verification_type: type,
+    })
   }
 
   // ── audit trail ───────────────────────────────────────────────────────
