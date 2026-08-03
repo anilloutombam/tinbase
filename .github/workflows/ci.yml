@@ -15,7 +15,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx tsc --noEmit
+      # Emit rather than --noEmit: the CLI tests spawn dist/cli.js, and skipped
+      # themselves when dist was absent - so they never ran here. Type checking
+      # is identical either way, so this costs nothing extra.
+      - run: npx tsc -p tsconfig.json
       - name: Tests (wasm engine)
         run: npm test
       - name: Tests (native engine)
