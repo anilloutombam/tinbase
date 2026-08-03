@@ -4,7 +4,7 @@
  * to {@link QueryBuilder}, and renders PostgREST-shaped responses (Content-Range
  * counts, singular-object media type, Prefer handling).
  */
-import { quoteIdent, quoteLiteral, type Database, type FunctionInfo } from '../db/database.js'
+import { quoteIdent, quoteLiteral, type Database, type FunctionInfo, type SchemaInfo } from '../db/database.js'
 import { ApiError, TINBASE_VERSION, type RequestContext } from '../types.js'
 import { QueryBuilder, pgArrayLiteral, renderColumnExpr, sanitizeCast } from './build.js'
 import { errorToResponse, jsonResponse } from './errors.js'
@@ -51,6 +51,50 @@ function parseExplain(accept: string): { format: 'JSON' | 'TEXT'; options: strin
     ? m[1].split('|').map((s) => s.trim().toLowerCase()).filter((o) => allowed.has(o))
     : []
   return { format, options }
+}
+
+/**
+ * pg types whose values reach us as strings on the subset engine but which
+ * PostgREST serializes as JSON numbers. pg-mem's pg adapter follows the
+ * node-postgres convention — numeric and int8 come back as strings to preserve
+ * precision — and its (identity) row_to_json keeps them strings inside the
+ * aggregated body. Real Supabase hands clients `score: 98.4`, not `"98.4"`,
+ * so without coercion preview-only code like `athlete.score.toFixed(1)`
+ * crashes while the same app works against a real backend. The full engines
+ * don't need this: their json_agg runs in actual Postgres, which already
+ * emits JSON numbers. int8 beyond 2^53 loses precision here exactly as it
+ * does through PostgREST's own JSON serialization.
+ */
+// Both spellings of each type: real Postgres/PGlite report pg_type names
+// ('numeric', 'int8') in information_schema.columns.udt_name; pg-mem reports
+// its own type names ('decimal', 'bigint').
+const JSON_NUMBER_UDTS = new Set(['numeric', 'decimal', 'int8', 'bigint'])
+
+/**
+ * In-place: convert string values of numeric/int8-typed columns to JS numbers,
+ * PostgREST-style. Recurses into embedded relations, which PostgREST keys by
+ * table name for the plain `select=*,children(*)` shape; alias-renamed columns
+ * or embeds keep whatever the engine produced (we can't map an alias back to a
+ * column without re-parsing the select tree — acceptable for the subset engine).
+ */
+export function coerceJsonNumbers(rows: unknown[], table: string, info: SchemaInfo): void {
+  const walk = (row: unknown, tableName: string): void => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return
+    const cols = info.tables.get(tableName)?.columns
+    const rec = row as Record<string, unknown>
+    for (const [key, val] of Object.entries(rec)) {
+      if (typeof val === 'string') {
+        if (cols?.some((c) => c.name === key && JSON_NUMBER_UDTS.has(c.udtName))) {
+          const n = Number(val)
+          if (Number.isFinite(n)) rec[key] = n
+        }
+      } else if (val && typeof val === 'object' && info.tables.has(key)) {
+        if (Array.isArray(val)) for (const item of val) walk(item, key)
+        else walk(val, key)
+      }
+    }
+  }
+  for (const row of rows) walk(row, table)
 }
 
 /** Serialize an array of row objects to CSV (RFC 4180), matching `.csv()`. */
@@ -187,6 +231,7 @@ export class RestHandler {
           }
           return { rows: (res.rows[0] as { body: unknown[] }).body, count }
         })
+        if (this.db.engine.minimalBootstrap) coerceJsonNumbers(rows, table, info)
         return this.dataResponse(rows, {
           status: 200,
           count,
@@ -211,7 +256,7 @@ export class RestHandler {
           missingDefault: prefer.missing === 'default',
           returning: queryReturning,
         })
-        return this.runMutation(ctx, built, { status: 201, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc })
+        return this.runMutation(ctx, built, { status: 201, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc, table, info })
       }
 
       case 'PATCH': {
@@ -228,7 +273,7 @@ export class RestHandler {
         const cdc = this.db.jsCdc ? { schema, table, type: 'UPDATE' as const } : null
         const queryReturning = returning || !!cdc
         const built = builder.buildUpdate(table, body as Record<string, unknown>, { returning: queryReturning })
-        return this.runMutation(ctx, built, { status: 200, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc })
+        return this.runMutation(ctx, built, { status: 200, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc, table, info })
       }
 
       case 'DELETE': {
@@ -236,7 +281,7 @@ export class RestHandler {
         const cdc = this.db.jsCdc ? { schema, table, type: 'DELETE' as const } : null
         const queryReturning = returning || !!cdc
         const built = builder.buildDelete(table, { returning: queryReturning })
-        return this.runMutation(ctx, built, { status: 200, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc })
+        return this.runMutation(ctx, built, { status: 200, returning, queryReturning, wantsObject, wantsCsv, prefer, cdc, table, info })
       }
 
       default:
@@ -255,6 +300,8 @@ export class RestHandler {
       wantsCsv: boolean
       prefer: Prefer
       cdc: { schema: string; table: string; type: 'INSERT' | 'UPDATE' | 'DELETE' } | null
+      table: string
+      info: SchemaInfo
     }
   ): Promise<Response> {
     const { rows, affected } = await this.db.withContext(ctx, async (query) => {
@@ -264,6 +311,10 @@ export class RestHandler {
       }
       return { rows: null, affected: res.affectedRows ?? 0 }
     })
+
+    // Coerce BEFORE emitCdc so realtime payloads carry numbers too, matching
+    // what Supabase's postgres_changes delivers.
+    if (rows && this.db.engine.minimalBootstrap) coerceJsonNumbers(rows, opts.table, opts.info)
 
     // synthesize CDC events for trigger-less engines (pg-mem)
     if (opts.cdc && rows) {

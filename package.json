@@ -1,6 +1,6 @@
 {
   "name": "tinbase",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "A Docker-free, Supabase-compatible local backend — real Postgres (embedded native or PGlite/WASM), wire-compatible with supabase-js.",
   "type": "module",
   "author": "Sanket Sahu",
@@ -61,7 +61,7 @@
     "url": "https://github.com/tinbase/tinbase/issues"
   },
   "optionalDependencies": {
-    "pg-mem": "npm:@tinbase/pg-mem@^3.2.0",
-    "esbuild": "^0.28.0"
+    "esbuild": "^0.28.0",
+    "pg-mem": "npm:@tinbase/pg-mem@^3.3.0"
   }
 }
