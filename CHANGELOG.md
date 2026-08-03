@@ -4,6 +4,39 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.11.2]
+
+### Fixed
+- **`numeric` and `int8` serialize as JSON numbers on the pg-mem engine, matching
+  PostgREST.** pg-mem's pg adapter follows the node-postgres convention and hands
+  both types back as strings to preserve precision, and its identity
+  `row_to_json` kept them strings inside the aggregated body — so an app doing
+  `athlete.score.toFixed(1)` crashed against an in-page preview while the same
+  code worked against real Supabase, which sends `score: 98.4`. Rows are now
+  coerced at the REST layer on the subset engine only, driven by
+  `information_schema` column types, and applied to reads, mutation echoes, and
+  CDC payloads alike — so realtime carries numbers too. Numeric-looking `text`
+  stays text. The full engines are untouched: their `json_agg` runs in real
+  Postgres, which already emits JSON numbers. `int8` past 2^53 loses precision
+  here exactly as it does through PostgREST's own serialization.
+
+  Two known limits, both scoped to the subset engine: values reached through a
+  column alias or an alias-renamed embed keep whatever the engine produced,
+  because an alias can't be mapped back to its column without re-parsing the
+  select tree.
+- **Foreign-key introspection no longer depends on `constraint_column_usage`,**
+  which pg-mem ships empty. It now joins `referential_constraints` against
+  `key_column_usage`, pairing composite FK columns by ordinal instead of relying
+  on dedup order. On pg-mem this replaces bogus `PGRST200` "relationship not
+  found" errors with a genuine SQL execution failure on the correlated lateral
+  subquery — embeds still aren't supported there, but the error now reflects the
+  real cause instead of misreporting the schema.
+
+### Changed
+- The optional `pg-mem` dependency moves to `@tinbase/pg-mem@^3.3.0`, which is
+  where `information_schema.referential_constraints` arrived. Installs that pin
+  the older 3.2.x will not have it.
+
 ## [0.11.1]
 
 ### Fixed
