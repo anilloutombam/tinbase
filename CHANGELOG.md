@@ -4,6 +4,73 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.12.1]
+
+### Changed
+- **Requires `@tinbase/pg-mem` 3.4.0 or newer**, up from 3.3.0, and the floor is a
+  hard one rather than a preference: two things tinbase used to correct on its own
+  are now fixed inside the engine, so 3.3.x would reintroduce both. Only the
+  optional pgmem engine is affected; nothing changes for the native or PGlite
+  engines. A fresh install picks this up on its own.
+
+### Fixed
+- **Logging out actually ends the session.** `POST /auth/v1/logout` revoked refresh
+  tokens but recorded nothing an *access* token could be checked against, and
+  `/auth/v1/user` only verified the JWT signature. So a logged-out token kept
+  returning 200 with the full user object until it expired, which defeats the
+  reason server-side code validates with `getUser(jwt)` instead of verifying the
+  JWT locally: so that a logout takes effect immediately. Sessions are now
+  persisted in `auth.sessions`, keyed by the `session_id` claim the access token
+  already carried but nothing consulted, and logout deletes them. A refresh token
+  can no longer resurrect a deleted session. Thanks to @itsacoyote for the report
+  (#78).
+
+  `?scope=` is honoured: `global` (the default) ends every session for the user,
+  `local` ends only the calling one, `others` ends the rest. A refresh reuses its
+  existing `session_id`, so refreshing is not a silent logout of the token the
+  client still holds. Tokens carrying no `session_id` — the studio's impersonation
+  token, for instance — have no session to revoke and are unaffected.
+
+  This deliberately stops at the auth endpoints. PostgREST validates the JWT
+  signature and nothing else, so a logged-out token keeps working against
+  `/rest/v1` until it expires, in real Supabase exactly as here; making REST
+  consult session state would diverge from Supabase rather than match it.
+- **`order=relation(column)` orders by an embedded column** instead of failing.
+  PostgREST supports ordering top-level rows by a to-one embedded column, and
+  supabase-js exposes it as `.order('relation(column)')`, but the term was parsed
+  as a column named literally `"relation(column)"` and passed to Postgres, which
+  answered `42703 column t0.relation(column) does not exist`. It now resolves the
+  embed and emits a correlated scalar subquery, which is how embeds are already
+  rendered here. Thanks to @itsacoyote for the report (#79).
+
+  Ordering by a to-many relationship is rejected with a message naming it, since
+  it has no single value per base row — PostgREST rejects it too — and an unknown
+  relation reports `PGRST200` rather than leaking a Postgres error. `signup` and
+  `invite` verification links are also redeemable now, as a side effect of both
+  verify paths resolving verification types through one shared helper; they
+  previously matched no stored token row and always failed.
+- **The studio's table browser no longer lists tinbase's internals on the pgmem
+  engine.** pg-mem reported `auth.*`, `storage.*` and `supabase_migrations.*` as
+  living in `public`, so the studio showed 13 internal tables beside the project's
+  own — none of which could be opened, which is what their unknown row counts
+  meant. Fixed in the engine rather than filtered out here, so `public` now holds
+  only the project's tables and the internals are browsable under their own
+  schemas, as they always were on the real engines.
+
+### Internal
+- The numeric/int8 JSON coercion added in 0.11.2 is gone from the REST layer,
+  because pg-mem's json builders now emit JSON numbers themselves. 0.11.2
+  attributed the strings to pg-mem's pg adapter; they in fact came from
+  `to_json`/`row_to_json`/`json_agg` emitting the engine's internal string
+  representation, which is where it is now fixed. Responses are unchanged — the
+  parity tests covering them are untouched and still pass — but the correction
+  now also applies to embedded relations and to anything else reading those
+  functions, rather than only to requests passing through this REST handler.
+- CI builds before running tests. The CLI tests spawn `dist/cli.js` and returned
+  early when it was absent, which counted as passing, so they never ran in CI and
+  it reported green regardless. They now report as skipped when the build is
+  missing, and CI emits rather than only type-checking, so they actually run.
+
 ## [0.12.0]
 
 ### Added
