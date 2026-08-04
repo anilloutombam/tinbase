@@ -426,6 +426,19 @@ export class QueryBuilder {
     }
 
     if (candidates.length === 0) {
+      // PostgREST also accepts an fk column on the base table (`asset_id(*)`)
+      // or an fk constraint name in place of the target table name.
+      for (const fk of fks) {
+        if (fk.srcSchema !== this.schema || fk.tgtSchema !== this.schema) continue
+        if (fk.srcTable === baseTable && (fk.srcColumns.includes(target) || fk.constraintName === target)) {
+          candidates.push({ type: 'to-one', fk, targetTable: fk.tgtTable, single: true })
+        } else if (fk.tgtTable === baseTable && fk.constraintName === target) {
+          candidates.push({ type: 'to-many', fk, targetTable: fk.srcTable, single: this.isUniqueKey(fk.srcTable, fk.srcColumns) })
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
       // many-to-many through a junction table
       for (const [jname] of this.info.tables) {
         if (jname === baseTable || jname === target) continue
