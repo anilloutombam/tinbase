@@ -4,6 +4,24 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.12.2]
+
+### Fixed
+- **Embeds resolve by foreign-key column or constraint name, not only by table
+  name.** PostgREST lets you name the relationship in an embed by the fk column on
+  the base table (`select=*,asset:asset_id(*)`) or by the fk constraint itself,
+  instead of by the target table. Relationship resolution only ever matched table
+  names, so those perfectly valid supabase-js queries came back as `PGRST200`
+  "Could not find a relationship … in the schema cache" — which reads as a schema
+  problem rather than an unsupported spelling, so the natural next step was to go
+  looking for a missing foreign key that was there all along.
+
+  Table-name matching is tried first and is unchanged; the fk-column and
+  constraint-name passes only run when it finds nothing, so no existing query
+  changes meaning or becomes newly ambiguous. Both directions are covered: a
+  constraint name resolves a reverse (to-many) embed too, and stays a single
+  object when the fk is a unique key, as one-to-one embeds already did.
+
 ## [0.12.1]
 
 ### Changed
