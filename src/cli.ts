@@ -14,6 +14,7 @@ import { createBackend, generateTypes, createPgmemEngine, inspectDb } from './in
 import { computeDbDiff, pullSchema, shadowNativeDataDir } from './node/db-diff.js'
 import { attachNativeEngine, createNativeEngine, readRunningPostmaster } from './node/native/engine.js'
 import type { DbEngine } from './db/engine.js'
+import { readServerLock, removeServerLock, writeServerLock } from './node/server-lock.js'
 import { FsStorageDriver } from './node/fs-driver.js'
 import { loadProjectConfig } from './node/load-config.js'
 import { loadFunctions, loadFunctionEnv } from './node/load-functions.js'
@@ -179,6 +180,34 @@ function refuseIfServerRunning(dataDir: string | undefined, command: string): vo
   process.exit(1)
 }
 
+/**
+ * Refuse to run when a server is up on an engine this process cannot share.
+ *
+ * Only the native engine can be joined: it runs a real postmaster reachable over a
+ * socket. PGlite is an in-process embedded build, so a second process opening the
+ * same directory is two writers on one set of files - that produced a ledger row
+ * for a migration whose table was missing, unrepairable by re-running `migrate`
+ * because the ledger already said applied. pgmem holds everything in memory, so a
+ * second process shares nothing and its migration is a no-op that claims success.
+ * Both are worse than stopping, so stop is what we ask for.
+ */
+function refuseIfUnshareableServer(opts: CliOptions, command: string): void {
+  if (opts.engine === 'native' || opts.databaseUrl) return
+  const running = readServerLock(opts.dir)
+  if (!running) return
+  const why =
+    opts.engine === 'pgmem'
+      ? 'the pgmem engine keeps the database in memory, so this process shares nothing with it'
+      : 'the wasm engine (PGlite) runs in-process, and two processes writing one data directory corrupt it'
+  console.error(
+    `\n  \u2716 Cannot run ${command} while a server is running on the ${opts.engine} engine.\n` +
+      `    ${why}.\n` +
+      `    A server is live for this project (pid ${running.pid}${running.port ? `, port ${running.port}` : ''}).\n` +
+      `    Stop it and run ${command} again${opts.engine === 'pgmem' ? '; restarting applies migrations on boot' : ''}.\n`
+  )
+  process.exit(1)
+}
+
 /** True when `candidate` is a higher release than `current`, prerelease tags ignored. */
 export function isNewerVersion(candidate: string, current: string): boolean {
   const parse = (v: string): number[] =>
@@ -288,6 +317,7 @@ async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
 
   if (opts.command === 'db' && opts.positionals[0] === 'diff') {
+    refuseIfUnshareableServer(opts, 'db diff')
     // `tinbase db diff [-f name]` - DDL for schema changes not yet in migrations
     const project = await loadSupabaseProject(opts.dir)
     const liveDataDir = resolveDataDir(opts)
@@ -317,6 +347,7 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'db' && opts.positionals[0] === 'pull') {
+    refuseIfUnshareableServer(opts, 'db pull')
     // `tinbase db pull [name]` - write the current schema delta as a migration
     // and record it as already applied (so `start` won't re-run it)
     const project = await loadSupabaseProject(opts.dir)
@@ -340,6 +371,7 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'inspect') {
+    refuseIfUnshareableServer(opts, 'inspect')
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
     const inspectDataDir = resolveDataDir(opts)
@@ -374,6 +406,7 @@ async function main(): Promise<void> {
     // Checked before anything is deleted: the wipe would take postmaster.pid with
     // it, which is the lock that should have prevented a second cluster here.
     refuseIfServerRunning(dataDir, 'db reset')
+    refuseIfUnshareableServer(opts, 'db reset')
     const storageDir = opts.storageDir || join(opts.dir, '.tinbase', 'storage')
     if (dataDir) await rm(dataDir, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })
@@ -447,6 +480,7 @@ async function main(): Promise<void> {
   // `start` has to own its postmaster; migrate/status only read, so they attach to
   // one already running rather than failing on the data-directory lock.
   const readOnlyCommand = opts.command === 'migrate' || opts.command === 'status'
+  if (readOnlyCommand) refuseIfUnshareableServer(opts, opts.command)
   const engine = opts.databaseUrl
     ? undefined
     : opts.engine === 'native'
@@ -567,16 +601,26 @@ async function main(): Promise<void> {
     const supabase = createClient('${server.url}', '<anon key>')
 `)
 
+  // Lets the other commands see that this project is being served, on engines that
+  // advertise nothing themselves (wasm, pgmem). The native engine is discoverable
+  // through postgres's own postmaster.pid, but writing it for every engine keeps
+  // one answer to "is a server up?".
+  writeServerLock(opts.dir, { engine: opts.engine, port })
+
   // Fired after the server is already serving and deliberately not awaited, so a
   // slow or unreachable registry delays nothing.
   void printUpdateNotice(TINBASE_VERSION)
 
   const shutdown = async () => {
     console.log('\nshutting down…')
+    removeServerLock(opts.dir)
     await server.close().catch(() => {})
     await backend.close().catch(() => {})
     process.exit(0)
   }
+  // A hard exit (uncaught crash) would otherwise leave the marker behind; readers
+  // check the pid so it is not fatal, but clearing it keeps things tidy.
+  process.once('exit', () => removeServerLock(opts.dir))
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }
