@@ -26,6 +26,8 @@ import { join } from 'node:path'
 export interface ServerLock {
   pid: number
   engine: string
+  /** host it bound to, so another command can reach it */
+  host: string
   port: number
   /** ISO timestamp, for a human reading the file */
   startedAt: string
@@ -79,6 +81,7 @@ export function readServerLock(projectDir: string): ServerLock | null {
     return {
       pid: parsed.pid,
       engine: typeof parsed.engine === 'string' ? parsed.engine : 'unknown',
+      host: typeof parsed.host === 'string' && parsed.host ? parsed.host : '127.0.0.1',
       port: typeof parsed.port === 'number' ? parsed.port : 0,
       startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '',
     }

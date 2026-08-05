@@ -14,7 +14,7 @@ import { createBackend, generateTypes, createPgmemEngine, inspectDb } from './in
 import { computeDbDiff, pullSchema, shadowNativeDataDir } from './node/db-diff.js'
 import { attachNativeEngine, createNativeEngine, readRunningPostmaster } from './node/native/engine.js'
 import type { DbEngine } from './db/engine.js'
-import { readServerLock, removeServerLock, writeServerLock } from './node/server-lock.js'
+import { readServerLock, removeServerLock, writeServerLock, type ServerLock } from './node/server-lock.js'
 import { FsStorageDriver } from './node/fs-driver.js'
 import { loadProjectConfig } from './node/load-config.js'
 import { loadFunctions, loadFunctionEnv } from './node/load-functions.js'
@@ -195,6 +195,9 @@ function refuseIfUnshareableServer(opts: CliOptions, command: string): void {
   if (opts.engine === 'native' || opts.databaseUrl) return
   const running = readServerLock(opts.dir)
   if (!running) return
+  // migrate/status/inspect go through the running server instead (see
+  // runViaServer); only what cannot be delegated gets here.
+
   const why =
     opts.engine === 'pgmem'
       ? 'the pgmem engine keeps the database in memory, so this process shares nothing with it'
@@ -263,6 +266,134 @@ async function printUpdateNotice(current: string): Promise<void> {
     // offline, blocked, slow, or unparseable - a version notice is never worth
     // surfacing an error for
   }
+}
+
+/**
+ * Call the admin API of the server already serving this project.
+ *
+ * This is how migrate/status/inspect work on the wasm and pgmem engines, which no
+ * second process can open: PGlite runs in-process and pgmem holds the database in
+ * memory, so the only route to the live database is through the process that owns
+ * it. The native engine does not come here - it attaches to its postmaster
+ * directly, which needs no key and works with any secret.
+ *
+ * Exits with an explanation rather than returning, because every caller wants to
+ * stop: reaching the server is the only way for them to do the right thing.
+ */
+async function callRunningServer<T>(opts: CliOptions, lock: ServerLock, path: string, init?: RequestInit): Promise<T> {
+  // Same derivation the server used, so no key needs to be passed around. In
+  // production the server signs unique keys per start, which cannot be re-derived.
+  if (process.env.NODE_ENV === 'production') {
+    console.error(
+      `\n  \u2716 Cannot reach the running server under NODE_ENV=production.\n` +
+        `    Keys are unique per start there, so this command cannot authenticate.\n` +
+        `    Stop the server and run it again.\n`
+    )
+    process.exit(1)
+  }
+  const { serviceRoleKey } = await deriveApiKeys(opts.jwtSecret, 'deterministic')
+  const url = `http://${lock.host}:${lock.port}${path}`
+  let res: Response
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers: {
+        apikey: serviceRoleKey,
+        authorization: `Bearer ${serviceRoleKey}`,
+        'content-type': 'application/json',
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    })
+  } catch (e) {
+    console.error(
+      `\n  \u2716 A server is recorded for this project (pid ${lock.pid}) but ${url} did not answer.\n` +
+        `    ${(e as Error)?.message ?? e}\n` +
+        `    If it has since stopped, delete .tinbase/server.json and try again.\n`
+    )
+    process.exit(1)
+  }
+  if (res.status === 401 || res.status === 403) {
+    console.error(
+      `\n  \u2716 The running server rejected this command's key.\n` +
+        `    It was most likely started with a different --jwt-secret (or TINBASE_JWT_SECRET).\n` +
+        `    Pass the same secret, or stop the server and run this again.\n`
+    )
+    process.exit(1)
+  }
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    console.error(`\n  \u2716 The running server returned ${res.status}: ${body?.error ?? 'unknown error'}\n`)
+    process.exit(1)
+  }
+  return (await res.json()) as T
+}
+
+/**
+ * Run `command` through the server already serving this project, when the engine
+ * leaves no other way in.
+ *
+ * PGlite is in-process and pgmem is in-memory, so the process that owns the
+ * database is the only one that can touch it. Rather than refusing, the commands
+ * that have an admin equivalent are delegated to it: migrations still go through
+ * `Database.runMigrations` on the server, so ordering, transactions, ledger
+ * bookkeeping, seed hashing and the pgmem skip behaviour are the same code that
+ * `start` runs - not a reimplementation behind an endpoint.
+ *
+ * Returns false when there is nothing to delegate to, leaving the caller to open
+ * the database itself. The native engine never gets here: attaching to its
+ * postmaster is better, needing no key and working with any secret.
+ */
+async function runViaServer(opts: CliOptions): Promise<boolean> {
+  if (opts.engine === 'native' || opts.databaseUrl) return false
+  const lock = readServerLock(opts.dir)
+  if (!lock) return false
+
+  const note = `  using the server already running on port ${lock.port} (${lock.engine} engine)`
+
+  if (opts.command === 'migrate') {
+    const project = await loadSupabaseProject(opts.dir)
+    console.log(note)
+    const body = { migrations: project.migrations, seedSql: project.seedSql }
+    const { applied } = await callRunningServer<{ applied: string[] }>(opts, lock, '/admin/v1/migrate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (applied.length > 0) console.log(`  applied migrations: ${applied.join(', ')}`)
+    const { migrations } = await callRunningServer<{ migrations: unknown[] }>(opts, lock, '/admin/v1/migrations')
+    console.log(`${migrations.length} migration(s) applied.`)
+    return true
+  }
+
+  if (opts.command === 'status') {
+    console.log(note)
+    const { migrations } = await callRunningServer<{ migrations: { version: string; name: string | null }[] }>(
+      opts,
+      lock,
+      '/admin/v1/migrations'
+    )
+    if (migrations.length === 0) console.log('no migrations applied')
+    for (const m of migrations) console.log(`${m.version}  ${m.name ?? ''}`)
+    return true
+  }
+
+  if (opts.command === 'inspect') {
+    console.log(note)
+    const { tables } = await callRunningServer<{ tables: { name: string; rowCount: number }[] }>(
+      opts,
+      lock,
+      '/admin/v1/tables?schema=public'
+    )
+    if (tables.length === 0) {
+      console.log('No tables in schema "public".')
+      return true
+    }
+    const pad = Math.max(5, ...tables.map((t) => t.name.length))
+    console.log(`${'table'.padEnd(pad)}  ${'rows'.padStart(10)}`)
+    for (const t of tables) console.log(`${t.name.padEnd(pad)}  ${String(t.rowCount).padStart(10)}`)
+    return true
+  }
+
+  return false
 }
 
 /** Optional webhooks config at supabase/webhooks.json: [{ table, events?, url, headers? }]. */
@@ -371,6 +502,7 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'inspect') {
+    if (await runViaServer(opts)) return
     refuseIfUnshareableServer(opts, 'inspect')
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
@@ -480,7 +612,10 @@ async function main(): Promise<void> {
   // `start` has to own its postmaster; migrate/status only read, so they attach to
   // one already running rather than failing on the data-directory lock.
   const readOnlyCommand = opts.command === 'migrate' || opts.command === 'status'
-  if (readOnlyCommand) refuseIfUnshareableServer(opts, opts.command)
+  if (readOnlyCommand) {
+    if (await runViaServer(opts)) return
+    refuseIfUnshareableServer(opts, opts.command)
+  }
   const engine = opts.databaseUrl
     ? undefined
     : opts.engine === 'native'
@@ -605,7 +740,7 @@ async function main(): Promise<void> {
   // advertise nothing themselves (wasm, pgmem). The native engine is discoverable
   // through postgres's own postmaster.pid, but writing it for every engine keeps
   // one answer to "is a server up?".
-  writeServerLock(opts.dir, { engine: opts.engine, port })
+  writeServerLock(opts.dir, { engine: opts.engine, host: opts.host, port })
 
   // Fired after the server is already serving and deliberately not awaited, so a
   // slow or unreachable registry delays nothing.

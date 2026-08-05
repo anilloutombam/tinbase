@@ -5,9 +5,12 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 /**
- * The wasm and pgmem engines cannot be joined by a second process, and used to say
- * nothing about it. What happened instead was worse than the native engine's lock
- * error:
+ * The wasm and pgmem engines cannot be opened by a second process - PGlite runs
+ * in-process, pgmem holds the database in memory - so the process serving the
+ * project is the only one that can reach it. Commands are routed through its admin
+ * API rather than opening the database themselves.
+ *
+ * What used to happen was worse than the native engine's lock error:
  *
  * - wasm: `migrate` reported success while two PGlite instances wrote the same
  *   directory. The ledger recorded the migration as applied but its table was
@@ -16,10 +19,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
  * - pgmem: `migrate` reported success against its own throwaway in-memory database,
  *   leaving the running server untouched. A no-op that claimed to have worked.
  *
- * Both now refuse while a server is up, keyed off the marker `start` writes.
+ * `db reset` still refuses: it deletes the data directory, which is not something to
+ * do under a live server whatever the engine.
  */
 const CLI = join(process.cwd(), 'dist', 'cli.js')
 const BUILT = existsSync(CLI)
+
+/** Run expecting success; returns stdout. */
+function ok(dir: string, engine: string, ...args: string[]): string {
+  return execFileSync('node', [CLI, ...args, '--dir', dir, '--engine', engine], { encoding: 'utf8' })
+}
 
 /** Run expecting a non-zero exit; returns combined output. */
 function failing(dir: string, engine: string, ...args: string[]): string {
@@ -69,14 +78,41 @@ for (const engine of ['wasm', 'pgmem'] as const) {
       expect(existsSync(join(dir, '.tinbase', 'server.json'))).toBe(true)
     })
 
-    for (const cmd of [['migrate'], ['status'], ['inspect'], ['db', 'reset']]) {
-      it(`refuses ${cmd.join(' ')} rather than pretending it worked`, { timeout: 120000 }, () => {
-        const out = failing(dir, engine, ...cmd)
-        expect(out).not.toBe('__SUCCEEDED__')
-        expect(out).toContain(`Cannot run ${cmd.join(' ')}`)
-        expect(out).toContain(engine)
+    it('migrate applies through the running server', { timeout: 120000 }, async () => {
+      const out = ok(dir, engine, 'migrate')
+      expect(out).toContain('using the server already running')
+      expect(out).toContain('002_add')
+
+      // The live server serves the new table straight away, which is the whole
+      // point: previously the migration went to a database nobody was serving.
+      const keys = ok(dir, engine, 'keys')
+      const serviceRole = keys.trim().split('\n').pop()!.trim()
+      const res = await fetch(`http://127.0.0.1:${port}/rest/v1/tags?select=*`, {
+        headers: { apikey: serviceRole, Authorization: `Bearer ${serviceRole}` },
       })
-    }
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual([])
+    })
+
+    it('status reads the ledger through the server', { timeout: 120000 }, () => {
+      const out = ok(dir, engine, 'status')
+      expect(out).toContain('using the server already running')
+      expect(out).toContain('001_init')
+      expect(out).toContain('002_add')
+    })
+
+    it('inspect lists the tables through the server', { timeout: 120000 }, () => {
+      const out = ok(dir, engine, 'inspect')
+      expect(out).toContain('notes')
+      expect(out).toContain('tags')
+    })
+
+    it('db reset still refuses, since it deletes the data directory', { timeout: 120000 }, () => {
+      const out = failing(dir, engine, 'db', 'reset')
+      expect(out).not.toBe('__SUCCEEDED__')
+      expect(out).toContain('Cannot run db reset')
+      expect(out).toContain(engine)
+    })
 
     it('leaves the running server serving', { timeout: 120000 }, async () => {
       const res = await fetch(`http://127.0.0.1:${port}/rest/v1/`)
