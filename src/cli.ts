@@ -30,7 +30,7 @@ const NATIVE_SUPPORTED =
   (process.platform === 'darwin' || process.platform === 'linux') &&
   (process.arch === 'arm64' || process.arch === 'x64')
 import { deriveApiKeys } from './jwt.js'
-import { DEFAULT_JWT_SECRET } from './types.js'
+import { DEFAULT_JWT_SECRET, TINBASE_VERSION } from './types.js'
 
 /** Parsed command + flags for one CLI invocation. */
 interface CliOptions {
@@ -177,6 +177,63 @@ function refuseIfServerRunning(dataDir: string | undefined, command: string): vo
       `    Stop it first, then run ${command} again.\n`
   )
   process.exit(1)
+}
+
+/** True when `candidate` is a higher release than `current`, prerelease tags ignored. */
+export function isNewerVersion(candidate: string, current: string): boolean {
+  const parse = (v: string): number[] =>
+    v.split('-')[0].split('.').map((n) => parseInt(n, 10))
+  const a = parse(candidate)
+  const b = parse(current)
+  if (a.some(Number.isNaN) || b.some(Number.isNaN)) return false
+  for (let i = 0; i < 3; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return false
+}
+
+/**
+ * Print one line when a newer tinbase has been published.
+ *
+ * Deliberately a notice and not a self-updater: replacing a running binary means
+ * an atomic swap, signature checks, and a way to ship an install that cannot
+ * repair itself. This is the part that carries most of the value - you find out -
+ * with none of that surface.
+ *
+ * Never allowed to affect the command it is attached to. It is not awaited before
+ * the server serves, it times out quickly, and every failure path is silent:
+ * offline, a proxy, a slow registry and a garbled response all just mean no
+ * notice. Skipped under CI and NODE_ENV=production, where nobody is reading
+ * startup chatter, and suppressible with TINBASE_NO_UPDATE_CHECK=1.
+ */
+async function printUpdateNotice(current: string): Promise<void> {
+  if (process.env.TINBASE_NO_UPDATE_CHECK || process.env.CI || process.env.NODE_ENV === 'production') return
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 1500)
+    // unref so a pending check can never hold the process open on its own
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    // No abbreviated-metadata accept header: that content type applies to the
+    // full packument and makes /latest answer with an empty body, which then
+    // failed to parse and was swallowed by the catch below - the check silently
+    // never worked.
+    const res = await fetch('https://registry.npmjs.org/tinbase/latest', { signal: controller.signal })
+    clearTimeout(timer)
+    if (!res.ok) return
+    const body = (await res.json()) as { version?: unknown }
+    const latest = typeof body.version === 'string' ? body.version : null
+    if (!latest || !isNewerVersion(latest, current)) return
+    console.log(
+      `\n  A newer tinbase is available: ${current} \u2192 ${latest}\n` +
+        `    npm i -g tinbase@latest   (or npx tinbase@latest)\n` +
+        `    Set TINBASE_NO_UPDATE_CHECK=1 to silence this.\n`
+    )
+  } catch {
+    // offline, blocked, slow, or unparseable - a version notice is never worth
+    // surfacing an error for
+  }
 }
 
 /** Optional webhooks config at supabase/webhooks.json: [{ table, events?, url, headers? }]. */
@@ -509,6 +566,10 @@ async function main(): Promise<void> {
   Use with supabase-js:
     const supabase = createClient('${server.url}', '<anon key>')
 `)
+
+  // Fired after the server is already serving and deliberately not awaited, so a
+  // slow or unreachable registry delays nothing.
+  void printUpdateNotice(TINBASE_VERSION)
 
   const shutdown = async () => {
     console.log('\nshutting down…')
