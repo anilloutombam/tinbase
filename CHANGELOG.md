@@ -4,6 +4,62 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.13.0]
+
+### Added
+- **CLI commands work while `tinbase start` is running.** Applying a migration used
+  to mean stopping your dev server first, which `supabase migration up` has never
+  required. `migrate`, `status` and `inspect` now reuse the running server on all
+  three engines, by two different routes because the engines differ in kind:
+  - **native**: attaches directly to the running postmaster over the socket it
+    already advertises in `postmaster.pid`, so no key is involved and it works with
+    any JWT secret and under `NODE_ENV=production`. `db diff` and `db pull` work
+    this way too.
+  - **wasm (PGlite) / pgmem**: PGlite runs in-process and pgmem holds the database
+    in memory, so the serving process is the only route in. These go through a new
+    `POST /admin/v1/migrate`, which delegates to the same `runMigrations` the server
+    calls on boot — so ordering, per-migration transactions, ledger bookkeeping,
+    seed hashing and pgmem's skip-and-warn behaviour are one implementation, not a
+    reimplementation behind an endpoint. `status` and `inspect` reuse the existing
+    `migrations` and `tables` endpoints.
+
+  On pgmem this is a new capability rather than a repair: with the database purely
+  in memory there was previously no way at all to migrate a running instance.
+- **`start` mentions a newer published version**, once, with the upgrade command.
+  Deliberately a notice and not a self-updater: swapping a running binary needs
+  atomicity, signature verification and an answer for an install that cannot repair
+  itself. It never affects the command it rides on — not awaited, 1.5s timeout,
+  every failure silent — and is skipped under `CI` and `NODE_ENV=production`, or
+  with `TINBASE_NO_UPDATE_CHECK=1`.
+
+### Fixed
+- **`db reset` no longer destroys a running server's database and calls it a
+  success.** The wipe removed `postmaster.pid` along with everything else — the very
+  lock that should have prevented it — so a second postmaster then initialised a
+  fresh cluster on the same path. The running server was left answering
+  `connection closed` on every request with its database deleted underneath, while
+  reset printed `reset complete`. It now refuses before deleting anything, on every
+  engine, naming the process that holds the directory.
+- **Migrating on the wasm engine while a server ran left the project unrepairable.**
+  Two PGlite instances wrote one directory, and the result was a migration ledger
+  claiming a migration whose table did not exist. Because the ledger said applied,
+  re-running `migrate` could never fix it; only `db reset` recovered, discarding the
+  data. On pgmem the same command was a no-op that reported success. Both now go
+  through the running server instead.
+- **`/rest/v1/` and `/auth/v1/health` report the running version.** Both served
+  `0.9.0` for three releases, because the constant behind them was maintained by
+  hand and nothing noticed when it drifted. A test now fails the moment it diverges
+  from `package.json`.
+
+### Changed
+- `db diff` and `db pull` refuse while a server is running on the wasm or pgmem
+  engines. Both need a shadow database to diff against, which a direct connection
+  can provide and an admin endpoint cannot; on the native engine they work.
+- `start` writes `.tinbase/server.json` (pid, engine, host, port) and removes it on
+  shutdown, so other commands can tell a server is up on engines that advertise
+  nothing themselves. A file left by a crashed run is detected by checking the pid,
+  so it cannot lock a project out of its own CLI.
+
 ## [0.12.2]
 
 ### Fixed
