@@ -507,7 +507,7 @@ async function main(): Promise<void> {
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
     const inspectDataDir = resolveDataDir(opts)
-    const engine = opts.engine === 'native' ? await openNativeForReading(inspectDataDir!) : undefined
+    const engine = opts.engine === 'native' ? await openNativeForReading(inspectDataDir!, (m) => console.log(`  ${m}`)) : undefined
     const backend = await createBackend({
       engine,
       dataDir: opts.engine === 'native' ? undefined : inspectDataDir,
