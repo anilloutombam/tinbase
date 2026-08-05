@@ -12,7 +12,8 @@ import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createBackend, generateTypes, createPgmemEngine, inspectDb } from './index.js'
 import { computeDbDiff, pullSchema, shadowNativeDataDir } from './node/db-diff.js'
-import { createNativeEngine } from './node/native/engine.js'
+import { attachNativeEngine, createNativeEngine, readRunningPostmaster } from './node/native/engine.js'
+import type { DbEngine } from './db/engine.js'
 import { FsStorageDriver } from './node/fs-driver.js'
 import { loadProjectConfig } from './node/load-config.js'
 import { loadFunctions, loadFunctionEnv } from './node/load-functions.js'
@@ -139,6 +140,45 @@ function resolveDataDir(opts: CliOptions): string | undefined {
   return join(opts.dir, '.tinbase', opts.engine === 'native' ? 'pgdata' : 'db')
 }
 
+/**
+ * The engine to read `dataDir` through, reusing a server that is already running
+ * for it rather than trying to start a second postmaster on the same directory.
+ *
+ * Two postmasters cannot share a data directory, so migrate/status/inspect/db
+ * diff/db pull all failed with `lock file "postmaster.pid" already exists` while
+ * a server was up - exactly when you would reach for them. Attaching also keeps
+ * the reader consistent with what the running server is serving.
+ */
+async function openNativeForReading(dataDir: string, log?: (m: string) => void): Promise<DbEngine> {
+  const attached = await attachNativeEngine(dataDir)
+  if (attached) {
+    log?.('using the server already running on this data directory')
+    return attached
+  }
+  return createNativeEngine({ dataDir, log })
+}
+
+/**
+ * Refuse to run when a server holds `dataDir`, for commands that would delete it.
+ *
+ * `db reset` used to go ahead: the wipe removed postmaster.pid along with
+ * everything else, which is the very lock that should have stopped it, so a second
+ * postmaster then initialised a fresh cluster on the same path. The running
+ * server was left serving `connection closed` on every request with its database
+ * deleted from under it - and reset reported success.
+ */
+function refuseIfServerRunning(dataDir: string | undefined, command: string): void {
+  if (!dataDir) return
+  const running = readRunningPostmaster(dataDir)
+  if (!running) return
+  console.error(
+    `\n  \u2716 ${command} would delete a data directory that a running server is using.\n` +
+      `    A server is live on ${dataDir} (pid ${running.pid}).\n` +
+      `    Stop it first, then run ${command} again.\n`
+  )
+  process.exit(1)
+}
+
 /** Optional webhooks config at supabase/webhooks.json: [{ table, events?, url, headers? }]. */
 function loadWebhooks(dir: string): import('./webhooks/service.js').WebhookConfig[] {
   try {
@@ -194,7 +234,7 @@ async function main(): Promise<void> {
     // `tinbase db diff [-f name]` - DDL for schema changes not yet in migrations
     const project = await loadSupabaseProject(opts.dir)
     const liveDataDir = resolveDataDir(opts)
-    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
+    const nativeLive = opts.engine === 'native' ? await openNativeForReading(liveDataDir!, (m) => console.error(`  ${m}`)) : undefined
     const ddl = await computeDbDiff({
       liveEngine: nativeLive,
       liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
@@ -224,7 +264,7 @@ async function main(): Promise<void> {
     // and record it as already applied (so `start` won't re-run it)
     const project = await loadSupabaseProject(opts.dir)
     const liveDataDir = resolveDataDir(opts)
-    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
+    const nativeLive = opts.engine === 'native' ? await openNativeForReading(liveDataDir!, (m) => console.error(`  ${m}`)) : undefined
     const res = await pullSchema({
       liveEngine: nativeLive,
       liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
@@ -246,7 +286,7 @@ async function main(): Promise<void> {
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
     const inspectDataDir = resolveDataDir(opts)
-    const engine = opts.engine === 'native' ? await createNativeEngine({ dataDir: inspectDataDir! }) : undefined
+    const engine = opts.engine === 'native' ? await openNativeForReading(inspectDataDir!) : undefined
     const backend = await createBackend({
       engine,
       dataDir: opts.engine === 'native' ? undefined : inspectDataDir,
@@ -274,6 +314,9 @@ async function main(): Promise<void> {
     }
     // `tinbase db reset` - wipe data + storage and re-run migrations + seed fresh
     const dataDir = resolveDataDir(opts)
+    // Checked before anything is deleted: the wipe would take postmaster.pid with
+    // it, which is the lock that should have prevented a second cluster here.
+    refuseIfServerRunning(dataDir, 'db reset')
     const storageDir = opts.storageDir || join(opts.dir, '.tinbase', 'storage')
     if (dataDir) await rm(dataDir, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })
@@ -344,13 +387,18 @@ async function main(): Promise<void> {
 
   // --database-url takes over engine selection: createBackend builds the
   // external-Postgres engine from the URL.
+  // `start` has to own its postmaster; migrate/status only read, so they attach to
+  // one already running rather than failing on the data-directory lock.
+  const readOnlyCommand = opts.command === 'migrate' || opts.command === 'status'
   const engine = opts.databaseUrl
     ? undefined
     : opts.engine === 'native'
-      ? await createNativeEngine({
-          dataDir: dataDir!,
-          log: (msg) => console.log(`  ${msg}`),
-        })
+      ? readOnlyCommand
+        ? await openNativeForReading(dataDir!, (msg) => console.log(`  ${msg}`))
+        : await createNativeEngine({
+            dataDir: dataDir!,
+            log: (msg) => console.log(`  ${msg}`),
+          })
       : opts.engine === 'pgmem'
         ? await createPgmemEngine()
         : undefined
