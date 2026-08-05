@@ -230,6 +230,71 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
 }
 
 /**
+ * A live postmaster already serving `dataDir`, read from its own pid file.
+ *
+ * Postgres records everything needed to reach it - pid, port and the socket
+ * directory - so no separate state file is needed, and the file is maintained by
+ * postgres rather than by us. Returns null when there is no server, when the pid
+ * it names is dead (a crashed run leaves the file behind), or when it has not
+ * reported "ready".
+ */
+export interface RunningPostmaster {
+  pid: number
+  port: number
+  socketDir: string
+}
+
+export function readRunningPostmaster(dataDir: string): RunningPostmaster | null {
+  const pidPath = join(dataDir, 'postmaster.pid')
+  if (!existsSync(pidPath)) return null
+  try {
+    // Format is positional and stable across supported versions:
+    // 1 pid, 2 data dir, 3 start time, 4 port, 5 socket dir, ... 8 status.
+    const lines = readFileSync(pidPath, 'utf8').split('\n')
+    const pid = parseInt(lines[0]?.trim() ?? '', 10)
+    const port = parseInt(lines[3]?.trim() ?? '', 10)
+    const socketDir = lines[4]?.trim()
+    if (!pid || !port || !socketDir) return null
+    try {
+      process.kill(pid, 0) // throws when the process is gone
+    } catch {
+      return null // stale file from a crashed run
+    }
+    // Line 8 is "ready" once it is accepting connections; anything else (e.g.
+    // "starting") means connecting would race the boot.
+    if ((lines[7]?.trim() ?? '') !== 'ready') return null
+    return { pid, port, socketDir }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Attach to a postmaster that another process already started for `dataDir`,
+ * as a client, without starting one of our own.
+ *
+ * Two postmasters cannot share a data directory, so every command that opened
+ * the engine directly - migrate, status, inspect, db diff, db pull - failed with
+ * `lock file "postmaster.pid" already exists` whenever a server was running,
+ * which is precisely when you would want to run them. The socket is 0700 and
+ * same-uid, so reaching it grants nothing that access to the data directory did
+ * not already grant.
+ *
+ * Returns null when nothing is running, leaving the caller to start its own.
+ */
+export async function attachNativeEngine(dataDir: string): Promise<DbEngine | null> {
+  const running = readRunningPostmaster(dataDir)
+  if (!running) return null
+  const socketPath = join(running.socketDir, `.s.PGSQL.${running.port}`)
+  if (!existsSync(socketPath)) return null
+  return buildWireEngine({
+    connect: () => PgWireClient.connect({ socketPath, user: 'postgres', database: 'postgres' }),
+    // We did not start it, so closing must not stop it - only drop our client.
+    onClose: async () => {},
+  })
+}
+
+/**
  * Postgres refuses to boot if a postmaster.pid names a live process. When the
  * previous run crashed the pid is stale; postgres usually clears it, but if the
  * data dir moved or the boot ID differs it may not - remove it when the named

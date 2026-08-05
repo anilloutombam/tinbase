@@ -12,7 +12,9 @@ import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createBackend, generateTypes, createPgmemEngine, inspectDb } from './index.js'
 import { computeDbDiff, pullSchema, shadowNativeDataDir } from './node/db-diff.js'
-import { createNativeEngine } from './node/native/engine.js'
+import { attachNativeEngine, createNativeEngine, readRunningPostmaster } from './node/native/engine.js'
+import type { DbEngine } from './db/engine.js'
+import { readServerLock, removeServerLock, writeServerLock, type ServerLock } from './node/server-lock.js'
 import { FsStorageDriver } from './node/fs-driver.js'
 import { loadProjectConfig } from './node/load-config.js'
 import { loadFunctions, loadFunctionEnv } from './node/load-functions.js'
@@ -29,7 +31,7 @@ const NATIVE_SUPPORTED =
   (process.platform === 'darwin' || process.platform === 'linux') &&
   (process.arch === 'arm64' || process.arch === 'x64')
 import { deriveApiKeys } from './jwt.js'
-import { DEFAULT_JWT_SECRET } from './types.js'
+import { DEFAULT_JWT_SECRET, TINBASE_VERSION } from './types.js'
 
 /** Parsed command + flags for one CLI invocation. */
 interface CliOptions {
@@ -139,6 +141,261 @@ function resolveDataDir(opts: CliOptions): string | undefined {
   return join(opts.dir, '.tinbase', opts.engine === 'native' ? 'pgdata' : 'db')
 }
 
+/**
+ * The engine to read `dataDir` through, reusing a server that is already running
+ * for it rather than trying to start a second postmaster on the same directory.
+ *
+ * Two postmasters cannot share a data directory, so migrate/status/inspect/db
+ * diff/db pull all failed with `lock file "postmaster.pid" already exists` while
+ * a server was up - exactly when you would reach for them. Attaching also keeps
+ * the reader consistent with what the running server is serving.
+ */
+async function openNativeForReading(dataDir: string, log?: (m: string) => void): Promise<DbEngine> {
+  const attached = await attachNativeEngine(dataDir)
+  if (attached) {
+    log?.('using the server already running on this data directory')
+    return attached
+  }
+  return createNativeEngine({ dataDir, log })
+}
+
+/**
+ * Refuse to run when a server holds `dataDir`, for commands that would delete it.
+ *
+ * `db reset` used to go ahead: the wipe removed postmaster.pid along with
+ * everything else, which is the very lock that should have stopped it, so a second
+ * postmaster then initialised a fresh cluster on the same path. The running
+ * server was left serving `connection closed` on every request with its database
+ * deleted from under it - and reset reported success.
+ */
+function refuseIfServerRunning(dataDir: string | undefined, command: string): void {
+  if (!dataDir) return
+  const running = readRunningPostmaster(dataDir)
+  if (!running) return
+  console.error(
+    `\n  \u2716 ${command} would delete a data directory that a running server is using.\n` +
+      `    A server is live on ${dataDir} (pid ${running.pid}).\n` +
+      `    Stop it first, then run ${command} again.\n`
+  )
+  process.exit(1)
+}
+
+/**
+ * Refuse to run when a server is up on an engine this process cannot share.
+ *
+ * Only the native engine can be joined: it runs a real postmaster reachable over a
+ * socket. PGlite is an in-process embedded build, so a second process opening the
+ * same directory is two writers on one set of files - that produced a ledger row
+ * for a migration whose table was missing, unrepairable by re-running `migrate`
+ * because the ledger already said applied. pgmem holds everything in memory, so a
+ * second process shares nothing and its migration is a no-op that claims success.
+ * Both are worse than stopping, so stop is what we ask for.
+ */
+function refuseIfUnshareableServer(opts: CliOptions, command: string): void {
+  if (opts.engine === 'native' || opts.databaseUrl) return
+  const running = readServerLock(opts.dir)
+  if (!running) return
+  // migrate/status/inspect go through the running server instead (see
+  // runViaServer); only what cannot be delegated gets here.
+
+  const why =
+    opts.engine === 'pgmem'
+      ? 'the pgmem engine keeps the database in memory, so this process shares nothing with it'
+      : 'the wasm engine (PGlite) runs in-process, and two processes writing one data directory corrupt it'
+  console.error(
+    `\n  \u2716 Cannot run ${command} while a server is running on the ${opts.engine} engine.\n` +
+      `    ${why}.\n` +
+      `    A server is live for this project (pid ${running.pid}${running.port ? `, port ${running.port}` : ''}).\n` +
+      `    Stop it and run ${command} again${opts.engine === 'pgmem' ? '; restarting applies migrations on boot' : ''}.\n`
+  )
+  process.exit(1)
+}
+
+/** True when `candidate` is a higher release than `current`, prerelease tags ignored. */
+export function isNewerVersion(candidate: string, current: string): boolean {
+  const parse = (v: string): number[] =>
+    v.split('-')[0].split('.').map((n) => parseInt(n, 10))
+  const a = parse(candidate)
+  const b = parse(current)
+  if (a.some(Number.isNaN) || b.some(Number.isNaN)) return false
+  for (let i = 0; i < 3; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return false
+}
+
+/**
+ * Print one line when a newer tinbase has been published.
+ *
+ * Deliberately a notice and not a self-updater: replacing a running binary means
+ * an atomic swap, signature checks, and a way to ship an install that cannot
+ * repair itself. This is the part that carries most of the value - you find out -
+ * with none of that surface.
+ *
+ * Never allowed to affect the command it is attached to. It is not awaited before
+ * the server serves, it times out quickly, and every failure path is silent:
+ * offline, a proxy, a slow registry and a garbled response all just mean no
+ * notice. Skipped under CI and NODE_ENV=production, where nobody is reading
+ * startup chatter, and suppressible with TINBASE_NO_UPDATE_CHECK=1.
+ */
+async function printUpdateNotice(current: string): Promise<void> {
+  if (process.env.TINBASE_NO_UPDATE_CHECK || process.env.CI || process.env.NODE_ENV === 'production') return
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 1500)
+    // unref so a pending check can never hold the process open on its own
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    // No abbreviated-metadata accept header: that content type applies to the
+    // full packument and makes /latest answer with an empty body, which then
+    // failed to parse and was swallowed by the catch below - the check silently
+    // never worked.
+    const res = await fetch('https://registry.npmjs.org/tinbase/latest', { signal: controller.signal })
+    clearTimeout(timer)
+    if (!res.ok) return
+    const body = (await res.json()) as { version?: unknown }
+    const latest = typeof body.version === 'string' ? body.version : null
+    if (!latest || !isNewerVersion(latest, current)) return
+    console.log(
+      `\n  A newer tinbase is available: ${current} \u2192 ${latest}\n` +
+        `    npm i -g tinbase@latest   (or npx tinbase@latest)\n` +
+        `    Set TINBASE_NO_UPDATE_CHECK=1 to silence this.\n`
+    )
+  } catch {
+    // offline, blocked, slow, or unparseable - a version notice is never worth
+    // surfacing an error for
+  }
+}
+
+/**
+ * Call the admin API of the server already serving this project.
+ *
+ * This is how migrate/status/inspect work on the wasm and pgmem engines, which no
+ * second process can open: PGlite runs in-process and pgmem holds the database in
+ * memory, so the only route to the live database is through the process that owns
+ * it. The native engine does not come here - it attaches to its postmaster
+ * directly, which needs no key and works with any secret.
+ *
+ * Exits with an explanation rather than returning, because every caller wants to
+ * stop: reaching the server is the only way for them to do the right thing.
+ */
+async function callRunningServer<T>(opts: CliOptions, lock: ServerLock, path: string, init?: RequestInit): Promise<T> {
+  // Same derivation the server used, so no key needs to be passed around. In
+  // production the server signs unique keys per start, which cannot be re-derived.
+  if (process.env.NODE_ENV === 'production') {
+    console.error(
+      `\n  \u2716 Cannot reach the running server under NODE_ENV=production.\n` +
+        `    Keys are unique per start there, so this command cannot authenticate.\n` +
+        `    Stop the server and run it again.\n`
+    )
+    process.exit(1)
+  }
+  const { serviceRoleKey } = await deriveApiKeys(opts.jwtSecret, 'deterministic')
+  const url = `http://${lock.host}:${lock.port}${path}`
+  let res: Response
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers: {
+        apikey: serviceRoleKey,
+        authorization: `Bearer ${serviceRoleKey}`,
+        'content-type': 'application/json',
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    })
+  } catch (e) {
+    console.error(
+      `\n  \u2716 A server is recorded for this project (pid ${lock.pid}) but ${url} did not answer.\n` +
+        `    ${(e as Error)?.message ?? e}\n` +
+        `    If it has since stopped, delete .tinbase/server.json and try again.\n`
+    )
+    process.exit(1)
+  }
+  if (res.status === 401 || res.status === 403) {
+    console.error(
+      `\n  \u2716 The running server rejected this command's key.\n` +
+        `    It was most likely started with a different --jwt-secret (or TINBASE_JWT_SECRET).\n` +
+        `    Pass the same secret, or stop the server and run this again.\n`
+    )
+    process.exit(1)
+  }
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    console.error(`\n  \u2716 The running server returned ${res.status}: ${body?.error ?? 'unknown error'}\n`)
+    process.exit(1)
+  }
+  return (await res.json()) as T
+}
+
+/**
+ * Run `command` through the server already serving this project, when the engine
+ * leaves no other way in.
+ *
+ * PGlite is in-process and pgmem is in-memory, so the process that owns the
+ * database is the only one that can touch it. Rather than refusing, the commands
+ * that have an admin equivalent are delegated to it: migrations still go through
+ * `Database.runMigrations` on the server, so ordering, transactions, ledger
+ * bookkeeping, seed hashing and the pgmem skip behaviour are the same code that
+ * `start` runs - not a reimplementation behind an endpoint.
+ *
+ * Returns false when there is nothing to delegate to, leaving the caller to open
+ * the database itself. The native engine never gets here: attaching to its
+ * postmaster is better, needing no key and working with any secret.
+ */
+async function runViaServer(opts: CliOptions): Promise<boolean> {
+  if (opts.engine === 'native' || opts.databaseUrl) return false
+  const lock = readServerLock(opts.dir)
+  if (!lock) return false
+
+  const note = `  using the server already running on port ${lock.port} (${lock.engine} engine)`
+
+  if (opts.command === 'migrate') {
+    const project = await loadSupabaseProject(opts.dir)
+    console.log(note)
+    const body = { migrations: project.migrations, seedSql: project.seedSql }
+    const { applied } = await callRunningServer<{ applied: string[] }>(opts, lock, '/admin/v1/migrate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (applied.length > 0) console.log(`  applied migrations: ${applied.join(', ')}`)
+    const { migrations } = await callRunningServer<{ migrations: unknown[] }>(opts, lock, '/admin/v1/migrations')
+    console.log(`${migrations.length} migration(s) applied.`)
+    return true
+  }
+
+  if (opts.command === 'status') {
+    console.log(note)
+    const { migrations } = await callRunningServer<{ migrations: { version: string; name: string | null }[] }>(
+      opts,
+      lock,
+      '/admin/v1/migrations'
+    )
+    if (migrations.length === 0) console.log('no migrations applied')
+    for (const m of migrations) console.log(`${m.version}  ${m.name ?? ''}`)
+    return true
+  }
+
+  if (opts.command === 'inspect') {
+    console.log(note)
+    const { tables } = await callRunningServer<{ tables: { name: string; rowCount: number }[] }>(
+      opts,
+      lock,
+      '/admin/v1/tables?schema=public'
+    )
+    if (tables.length === 0) {
+      console.log('No tables in schema "public".')
+      return true
+    }
+    const pad = Math.max(5, ...tables.map((t) => t.name.length))
+    console.log(`${'table'.padEnd(pad)}  ${'rows'.padStart(10)}`)
+    for (const t of tables) console.log(`${t.name.padEnd(pad)}  ${String(t.rowCount).padStart(10)}`)
+    return true
+  }
+
+  return false
+}
+
 /** Optional webhooks config at supabase/webhooks.json: [{ table, events?, url, headers? }]. */
 function loadWebhooks(dir: string): import('./webhooks/service.js').WebhookConfig[] {
   try {
@@ -191,10 +448,11 @@ async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
 
   if (opts.command === 'db' && opts.positionals[0] === 'diff') {
+    refuseIfUnshareableServer(opts, 'db diff')
     // `tinbase db diff [-f name]` - DDL for schema changes not yet in migrations
     const project = await loadSupabaseProject(opts.dir)
     const liveDataDir = resolveDataDir(opts)
-    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
+    const nativeLive = opts.engine === 'native' ? await openNativeForReading(liveDataDir!, (m) => console.error(`  ${m}`)) : undefined
     const ddl = await computeDbDiff({
       liveEngine: nativeLive,
       liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
@@ -220,11 +478,12 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'db' && opts.positionals[0] === 'pull') {
+    refuseIfUnshareableServer(opts, 'db pull')
     // `tinbase db pull [name]` - write the current schema delta as a migration
     // and record it as already applied (so `start` won't re-run it)
     const project = await loadSupabaseProject(opts.dir)
     const liveDataDir = resolveDataDir(opts)
-    const nativeLive = opts.engine === 'native' ? await createNativeEngine({ dataDir: liveDataDir! }) : undefined
+    const nativeLive = opts.engine === 'native' ? await openNativeForReading(liveDataDir!, (m) => console.error(`  ${m}`)) : undefined
     const res = await pullSchema({
       liveEngine: nativeLive,
       liveDataDir: opts.engine === 'native' ? undefined : liveDataDir,
@@ -243,10 +502,12 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'inspect') {
+    if (await runViaServer(opts)) return
+    refuseIfUnshareableServer(opts, 'inspect')
     // `tinbase inspect` - per-table row counts and on-disk size
     const project = await loadSupabaseProject(opts.dir)
     const inspectDataDir = resolveDataDir(opts)
-    const engine = opts.engine === 'native' ? await createNativeEngine({ dataDir: inspectDataDir! }) : undefined
+    const engine = opts.engine === 'native' ? await openNativeForReading(inspectDataDir!, (m) => console.log(`  ${m}`)) : undefined
     const backend = await createBackend({
       engine,
       dataDir: opts.engine === 'native' ? undefined : inspectDataDir,
@@ -274,6 +535,10 @@ async function main(): Promise<void> {
     }
     // `tinbase db reset` - wipe data + storage and re-run migrations + seed fresh
     const dataDir = resolveDataDir(opts)
+    // Checked before anything is deleted: the wipe would take postmaster.pid with
+    // it, which is the lock that should have prevented a second cluster here.
+    refuseIfServerRunning(dataDir, 'db reset')
+    refuseIfUnshareableServer(opts, 'db reset')
     const storageDir = opts.storageDir || join(opts.dir, '.tinbase', 'storage')
     if (dataDir) await rm(dataDir, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })
@@ -344,13 +609,22 @@ async function main(): Promise<void> {
 
   // --database-url takes over engine selection: createBackend builds the
   // external-Postgres engine from the URL.
+  // `start` has to own its postmaster; migrate/status only read, so they attach to
+  // one already running rather than failing on the data-directory lock.
+  const readOnlyCommand = opts.command === 'migrate' || opts.command === 'status'
+  if (readOnlyCommand) {
+    if (await runViaServer(opts)) return
+    refuseIfUnshareableServer(opts, opts.command)
+  }
   const engine = opts.databaseUrl
     ? undefined
     : opts.engine === 'native'
-      ? await createNativeEngine({
-          dataDir: dataDir!,
-          log: (msg) => console.log(`  ${msg}`),
-        })
+      ? readOnlyCommand
+        ? await openNativeForReading(dataDir!, (msg) => console.log(`  ${msg}`))
+        : await createNativeEngine({
+            dataDir: dataDir!,
+            log: (msg) => console.log(`  ${msg}`),
+          })
       : opts.engine === 'pgmem'
         ? await createPgmemEngine()
         : undefined
@@ -462,12 +736,26 @@ async function main(): Promise<void> {
     const supabase = createClient('${server.url}', '<anon key>')
 `)
 
+  // Lets the other commands see that this project is being served, on engines that
+  // advertise nothing themselves (wasm, pgmem). The native engine is discoverable
+  // through postgres's own postmaster.pid, but writing it for every engine keeps
+  // one answer to "is a server up?".
+  writeServerLock(opts.dir, { engine: opts.engine, host: opts.host, port })
+
+  // Fired after the server is already serving and deliberately not awaited, so a
+  // slow or unreachable registry delays nothing.
+  void printUpdateNotice(TINBASE_VERSION)
+
   const shutdown = async () => {
     console.log('\nshutting down…')
+    removeServerLock(opts.dir)
     await server.close().catch(() => {})
     await backend.close().catch(() => {})
     process.exit(0)
   }
+  // A hard exit (uncaught crash) would otherwise leave the marker behind; readers
+  // check the pid so it is not fatal, but clearing it keeps things tidy.
+  process.once('exit', () => removeServerLock(opts.dir))
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }

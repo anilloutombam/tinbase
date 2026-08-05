@@ -91,6 +91,7 @@ export class AdminApi {
       if (path === 'stats' && method === 'GET') return await this.stats()
       if (path === 'schemas' && method === 'GET') return await this.schemas()
       if (path === 'migrations' && method === 'GET') return await this.migrations()
+      if (path === 'migrate' && method === 'POST') return await this.runMigrations(req)
       if (path === 'policies' && method === 'GET') return await this.listPolicies(url)
       if (path === 'policies' && method === 'POST') return await this.createPolicy(req)
       if (path === 'policies' && method === 'DELETE') return await this.dropPolicy(url)
@@ -326,6 +327,41 @@ export class AdminApi {
       `select version, name, applied_at from supabase_migrations.schema_migrations order by version`
     )
     return json(200, { migrations: res.rows })
+  }
+
+  /**
+   * Apply migrations through the running server.
+   *
+   * The wasm and pgmem engines cannot be opened by a second process - PGlite is
+   * in-process, pgmem is in-memory - so `tinbase migrate` had no way to reach the
+   * database a server was serving. It went to a separate one instead and reported
+   * success: on wasm that left the ledger claiming a migration whose table did not
+   * exist, unrepairable by re-running because the ledger already said applied.
+   *
+   * Delegating to {@link Database.runMigrations} rather than executing the SQL here
+   * is the whole point: ordering, per-migration transactions, the search_path
+   * reset, ledger bookkeeping, seed hashing and the pgmem skip-and-warn behaviour
+   * all stay in one implementation, so this path cannot drift from the one `start`
+   * uses.
+   */
+  private async runMigrations(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => null)) as {
+      migrations?: { name?: unknown; sql?: unknown }[]
+      seedSql?: unknown
+    } | null
+    if (!body || !Array.isArray(body.migrations)) {
+      return json(400, { error: 'a JSON body with a migrations array is required' })
+    }
+    const migrations: { name: string; sql: string }[] = []
+    for (const m of body.migrations) {
+      if (typeof m?.name !== 'string' || typeof m?.sql !== 'string') {
+        return json(400, { error: 'each migration needs a string name and sql' })
+      }
+      migrations.push({ name: m.name, sql: m.sql })
+    }
+    const seedSql = typeof body.seedSql === 'string' ? body.seedSql : undefined
+    const applied = await this.db.runMigrations(migrations, seedSql)
+    return json(200, { applied })
   }
 
   /** List the RLS policies defined in a schema (from pg_policies). */

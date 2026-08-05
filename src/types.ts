@@ -146,8 +146,18 @@ export interface Mailer {
  */
 export const DEFAULT_JWT_SECRET = 'super-secret-jwt-token-with-at-least-32-characters-long'
 
-/** tinbase package version, surfaced in health/root responses. Keep in sync with package.json. */
-export const TINBASE_VERSION = '0.9.0'
+/**
+ * tinbase package version, surfaced in `/rest/v1/` and `/auth/v1/health`, and used
+ * for the update check on start.
+ *
+ * Hardcoded rather than read from package.json at runtime, because the
+ * single-binary build has no package.json to read and would report a fallback.
+ * It is therefore duplicated, and it drifted: it sat at 0.9.0 for three releases
+ * while both endpoints reported that to callers. `version stays in sync with
+ * package.json` in test/version.test.ts now fails the moment the two diverge, so
+ * a release cannot quietly ship the wrong number again.
+ */
+export const TINBASE_VERSION = '0.12.2'
 
 /** Per-request execution context derived from apikey/Authorization headers. */
 export interface RequestContext {
