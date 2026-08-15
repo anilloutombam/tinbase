@@ -4,6 +4,32 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.13.1]
+
+### Fixed
+- **A failing seed no longer takes the server down.** Seeding re-runs whenever
+  `supabase/seed.sql`'s hash changes, which meant an edited seed met a database that
+  already held the old rows and died on a duplicate key (`23505`); and when a migration
+  failed, the seed went on to reference tables that were never created (`42P01`). Neither
+  says anything about whether the database can serve — the schema was applied and the data
+  was intact — but startup aborted, so the project became permanently unreachable over
+  sample data. A seed error is now logged and skipped. The transaction has already rolled
+  back, and the hash is deliberately **not** recorded, so correcting `seed.sql` makes the
+  next start apply it. Migration failures still abort: schema is load-bearing in a way
+  that sample data is not.
+- **Crash recovery is waited out instead of being called a startup failure.** `connect()`
+  retried under a single 20-second deadline, but its two failure modes are not alike: a
+  refused connection means the postmaster has not opened the socket yet, while a `57P03`
+  reply means postgres is *alive* and running crash recovery, which on a loaded host with
+  a busy database takes minutes. Recovery that would have finished at 25 seconds surfaced
+  as a fatal error — and because the next boot restarts recovery from scratch, the
+  database never opened again. `57P03` now has its own budget (5 minutes, announced so it
+  is not a silent hang), and both are overridable with `TINBASE_PG_STARTUP_TIMEOUT_MS` and
+  `TINBASE_PG_RECOVERY_TIMEOUT_MS`.
+
+  Found together on a production fleet where 41 project databases sat in a permanent crash
+  loop, every one of them healthy underneath.
+
 ## [0.13.0]
 
 ### Added
