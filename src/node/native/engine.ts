@@ -10,7 +10,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { DbEngine } from '../../db/engine.js'
 import { PgWireClient } from './wire.js'
 import { buildWireEngine } from './wire-engine.js'
@@ -177,7 +177,7 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
 
   // A stale postmaster.pid (from a crashed run) makes postgres refuse to start.
   // Remove it if the process it names is no longer alive.
-  removeStalePidFile(join(opts.dataDir, 'postmaster.pid'))
+  removeStalePidFile(join(opts.dataDir, 'postmaster.pid'), opts.dataDir)
 
   // private socket dir - trust auth is safe because only this user can reach it.
   // Keep the path short: macOS caps unix socket paths at ~104 chars.
@@ -335,18 +335,76 @@ export async function attachNativeEngine(dataDir: string): Promise<DbEngine | nu
  * data dir moved or the boot ID differs it may not - remove it when the named
  * pid is dead so a fresh start succeeds.
  */
-function removeStalePidFile(pidPath: string): void {
+/**
+ * Decide whether a postmaster.pid describes a postmaster that is really still
+ * running, given the file's contents and two probes (injected so this is
+ * testable without spawning processes).
+ *
+ * "Is some process holding this PID?" is not the same question. PIDs are
+ * recycled, and in a container they are recycled immediately: every start
+ * numbers processes from 1, so a pid file left by a killed container names a
+ * PID that the *new* container has almost certainly reissued — often to node
+ * itself. Postgres then refuses to start ("lock file postmaster.pid already
+ * exists"), and because the collision recurs on every boot, the database never
+ * comes up again. So the PID must be confirmed to belong to a postgres process
+ * for this data directory before the file is treated as live.
+ *
+ * Unknowable cases stay conservative: if the process is alive and we cannot
+ * identify it, the file is left alone and postgres reports the conflict itself.
+ */
+export function pidFileIsStale(
+  contents: string,
+  dataDir: string,
+  isAlive: (pid: number) => boolean,
+  describe: (pid: number) => string | null
+): boolean {
+  const [pidLine, dirLine] = contents.split('\n')
+  const pid = parseInt(pidLine?.trim() ?? '', 10)
+  if (!pid || pid < 1) return true
+
+  // Line 2 is the data directory the postmaster was started with. A different
+  // one means this file was left by another cluster entirely.
+  const recorded = dirLine?.trim()
+  if (recorded && resolve(recorded) !== resolve(dataDir)) return true
+
+  if (!isAlive(pid)) return true
+
+  const cmd = describe(pid)
+  if (cmd === null) return false // cannot identify: let postgres decide
+  return !cmd.includes('postgres')
+}
+
+/** What is running as `pid`, or null if that cannot be determined. */
+function describeProcess(pid: number): string | null {
+  try {
+    // Linux: the canonical source, and the only one available in the slim
+    // container images tinbase ships in (no ps).
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim()
+  } catch {
+    /* not Linux, or the process vanished between the liveness check and here */
+  }
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { stdio: 'pipe' })
+      .toString()
+      .trim()
+  } catch {
+    return null
+  }
+}
+
+function removeStalePidFile(pidPath: string, dataDir: string): void {
   if (!existsSync(pidPath)) return
   try {
-    const pid = parseInt(readFileSync(pidPath, 'utf8').split('\n')[0]?.trim() ?? '', 10)
-    if (!pid) {
-      rmSync(pidPath, { force: true })
-      return
+    const contents = readFileSync(pidPath, 'utf8')
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0) // throws if the process does not exist
+        return true
+      } catch {
+        return false
+      }
     }
-    try {
-      process.kill(pid, 0) // throws if the process does not exist
-      // process is alive - leave the pid file; postgres will report the conflict
-    } catch {
+    if (pidFileIsStale(contents, dataDir, isAlive, describeProcess)) {
       rmSync(pidPath, { force: true })
     }
   } catch {
