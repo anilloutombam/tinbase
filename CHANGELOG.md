@@ -4,6 +4,25 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.13.2]
+
+### Fixed
+- **A recycled PID no longer looks like a running postmaster.** `postmaster.pid` was
+  treated as live whenever *some* process held the PID it names, which is a different
+  question from whether a postmaster is running — and in a container the difference is
+  decisive. Every start numbers processes from 1, so a pid file left behind by a killed
+  container names a PID the new container has almost certainly reissued, frequently to
+  node itself. Postgres then refused to start with `lock file "postmaster.pid" already
+  exists`, and because the collision recurs on every boot, the database never opened
+  again. The PID is now confirmed to belong to a postgres process for this data directory
+  (`/proc/<pid>/cmdline`, the only route available in the slim images tinbase ships in,
+  falling back to `ps` elsewhere), and the data directory recorded in the file is checked
+  too, so a file left by a different cluster is stale regardless of what holds its PID.
+
+  Unknowable cases stay conservative: alive but unidentifiable leaves the file alone and
+  lets postgres report the conflict, because deleting the lock of a postmaster that *is*
+  running would let a second one initialise over a live database.
+
 ## [0.13.1]
 
 ### Fixed
