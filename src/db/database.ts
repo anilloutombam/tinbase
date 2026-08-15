@@ -225,16 +225,34 @@ export class Database {
         [hash]
       )
       if (seen.rows.length === 0) {
-        await this.engine.transaction(async (tx) => {
-          await tx.exec(DEFAULT_SEARCH_PATH_SQL)
-          await tx.exec(rewriteMigrationSql(seedSql))
-          await tx.query(
-            `insert into supabase_migrations.seed_files (path, hash) values ('supabase/seed.sql', $1)
-             on conflict (path) do update set hash = excluded.hash, applied_at = now()`,
-            [hash]
+        try {
+          await this.engine.transaction(async (tx) => {
+            await tx.exec(DEFAULT_SEARCH_PATH_SQL)
+            await tx.exec(rewriteMigrationSql(seedSql))
+            await tx.query(
+              `insert into supabase_migrations.seed_files (path, hash) values ('supabase/seed.sql', $1)
+               on conflict (path) do update set hash = excluded.hash, applied_at = now()`,
+              [hash]
+            )
+          })
+          applied.push('seed.sql')
+        } catch (e) {
+          // A failed seed must not take the server down. Seeding runs whenever
+          // seed.sql's hash changes, so an edited seed meets a database that
+          // already holds the old rows and dies on a duplicate key — and a
+          // migration failure aborts startup, so the seed then references
+          // tables that were never created. Neither says anything about the
+          // database's health: the schema is applied, the data is intact, and
+          // every request would have been served fine. Aborting turned an
+          // untidy seed file into a permanently unreachable project.
+          //
+          // The transaction rolled back, and the hash is deliberately NOT
+          // recorded, so fixing seed.sql makes the next start apply it.
+          console.warn(
+            `  seed skipped: ${(e as Error)?.message?.split('\n')[0] ?? e}\n` +
+              `  (supabase/seed.sql did not apply; the database is otherwise up to date)`
           )
-        })
-        applied.push('seed.sql')
+        }
       }
     }
     if (applied.length > 0) {

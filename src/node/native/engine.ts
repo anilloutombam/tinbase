@@ -17,6 +17,22 @@ import { buildWireEngine } from './wire-engine.js'
 
 const DEFAULT_PG_VERSION = '17.7.0'
 
+/** Positive integer from an env var, or the fallback. */
+const envMs = (name: string, fallback: number): number => {
+  const n = Number(process.env[name])
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+/** How long to wait for the postmaster to start accepting connections. */
+const startupTimeoutMs = (): number => envMs('TINBASE_PG_STARTUP_TIMEOUT_MS', 20_000)
+
+/**
+ * How long to wait once postgres has answered "starting up". Generous on
+ * purpose: this is crash recovery, and giving up mid-recovery leaves a database
+ * that would have opened fine unreachable.
+ */
+const recoveryTimeoutMs = (): number => envMs('TINBASE_PG_RECOVERY_TIMEOUT_MS', 300_000)
+
 /** Options for {@link createNativeEngine}. */
 export interface NativeEngineOptions {
   /** Postgres data directory (created + initdb'd if missing). */
@@ -189,11 +205,30 @@ export async function createNativeEngine(opts: NativeEngineOptions): Promise<DbE
 
   const socketPath = join(sockDir, '.s.PGSQL.5432')
   const connect = async (): Promise<PgWireClient> => {
-    const deadline = Date.now() + 20_000
+    // Two different waits. A socket that refuses connections means the
+    // postmaster has not opened it yet — quick, and bounded tightly. A 57P03
+    // ("the database system is starting up") is a *reply*: postgres is alive
+    // and running crash recovery, which after an unclean shutdown of a busy
+    // database can legitimately take minutes on a loaded host. Holding both to
+    // 20s meant recovery that would have finished at 25s surfaced as a fatal
+    // startup error, and the database never came up again.
+    const deadline = Date.now() + startupTimeoutMs()
+    const recoveryDeadline = Date.now() + recoveryTimeoutMs()
+    let announcedRecovery = false
     for (;;) {
       try {
         return await PgWireClient.connect({ socketPath, user: 'postgres', database: 'postgres' })
       } catch (e) {
+        const starting = (e as { code?: string })?.code === '57P03'
+        if (starting) {
+          if (!announcedRecovery) {
+            announcedRecovery = true
+            console.warn('  postgres is starting up (crash recovery); waiting…')
+          }
+          if (Date.now() > recoveryDeadline) throw e
+          await new Promise((r) => setTimeout(r, 250))
+          continue
+        }
         if (childExited) {
           const detail = stderr.trim()
           throw new Error(
