@@ -4,6 +4,15 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [0.14.0]
+
+### Added
+- **Studio auto-login via URL.** Visiting `/_/?_key=<service_role_key>` now
+  injects the key into sessionStorage and authenticates the Studio shell
+  automatically, removing the need for manual login. The key is stripped from the
+  visible URL via `history.replaceState` so it cannot be bookmarked or leaked in
+  the address bar.
+
 ## [0.13.2]
 
 ### Fixed
