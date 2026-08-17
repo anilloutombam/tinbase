@@ -354,14 +354,27 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     // document); the ETag then lets an unchanged studio return 304 instead of
     // re-sending the full ~0.6 MB body. A strict CSP hardens the shell.
     if (path === '/_' || path.startsWith('/_/')) {
+      // Auto-login: if `?_key=<service_role>` is in the URL, inject
+      // the key into sessionStorage so the Studio shell authenticates
+      // without a manual login step.
+      const autoKey = url.searchParams.get('_key')
       const headers: Record<string, string> = {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-cache',
         'content-security-policy': ADMIN_CSP,
         'x-content-type-options': 'nosniff',
         'x-frame-options': 'DENY',
-        etag: ADMIN_ETAG,
       }
+      if (autoKey) {
+        const loginScript = `<script>sessionStorage.setItem("tinbase_service_key",${JSON.stringify(autoKey)});` +
+          // strip _key from the URL so it isn't visible / bookmarkable
+          `history.replaceState(null,"",location.pathname)</script>`
+        const html = ADMIN_HTML.includes('</head>')
+          ? ADMIN_HTML.replace('</head>', loginScript + '</head>')
+          : loginScript + ADMIN_HTML
+        return new Response(html, { status: 200, headers })
+      }
+      headers['etag'] = ADMIN_ETAG
       if (req.headers.get('if-none-match') === ADMIN_ETAG) {
         return new Response(null, { status: 304, headers })
       }
