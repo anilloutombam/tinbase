@@ -40,6 +40,10 @@ export async function createPgliteEngine(dataDir?: string): Promise<DbEngine> {
     async exec(sql: string): Promise<void> {
       await pg.exec(sql)
     },
+    async execMany(sql: string): Promise<EngineResults[]> {
+      const results = await pg.exec(sql)
+      return results.map((r) => ({ rows: r.rows, affectedRows: r.affectedRows }))
+    },
     transaction<T>(fn: (tx: EngineTx) => Promise<T>): Promise<T> {
       return pg.transaction(async (tx) => {
         return fn({

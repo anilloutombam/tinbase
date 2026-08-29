@@ -32,6 +32,15 @@ export interface DbEngine {
   query<T = any>(sql: string, params?: unknown[]): Promise<EngineResults<T>>
   /** run multiple SQL statements (no params) */
   exec(sql: string): Promise<void>
+  /**
+   * Run a multi-statement script and return one result per statement.
+   *
+   * Same wire path as {@link exec} - the underlying clients already hand back a
+   * result set per command, `exec` just drops them. The SQL editor needs them,
+   * because the extended (parameterized) protocol `query` uses accepts exactly
+   * one command per message and rejects a script with 42601.
+   */
+  execMany?(sql: string): Promise<EngineResults[]>
   /** serialized transaction; implementations must guarantee mutual exclusion */
   transaction<T>(fn: (tx: EngineTx) => Promise<T>): Promise<T>
   /** subscribe to pg_notify on a channel; returns an unsubscribe function */

@@ -8,6 +8,8 @@ import { applyAuthSettingsPatch, saveAuthSettings, type AuthSettings } from '../
 import { statusForSqlState } from '../rest/errors.js'
 import { quoteIdent } from '../db/database.js'
 import type { Database } from '../db/database.js'
+import type { EngineResults } from '../db/engine.js'
+import { splitStatements } from '../db/split-statements.js'
 import { signJwt } from '../jwt.js'
 import type { LogBuffer } from '../log-buffer.js'
 import type { RequestContext } from '../types.js'
@@ -296,9 +298,23 @@ export class AdminApi {
       // the REST layer uses - so role/claims never leak onto the shared connection
       // between concurrent requests. The claims value is passed as a bound
       // parameter, not interpolated.
+      // The extended (parameterized) protocol accepts exactly one command per
+      // message, so a pasted script used to come back as a 42601 syntax error.
+      // Only route multi-statement input down the simple-query path, so a single
+      // statement keeps its existing typed decoding untouched.
+      const statements = splitStatements(body.query)
+      const multi = statements.length > 1
+
       const res = role
-        ? await this.db.withContext({ role, claims: body.claims ?? { role } }, (q) => q(body.query!))
-        : await this.db.query(body.query)
+        ? await this.db.withContext({ role, claims: body.claims ?? { role } }, async (q) => {
+            // one statement at a time, so role + claims apply to all of them
+            let last: EngineResults = { rows: [] }
+            for (const stmt of statements) last = await q(stmt)
+            return last
+          })
+        : multi
+          ? await this.runScript(body.query, statements)
+          : await this.db.query(body.query)
       this.db.invalidateSchemaCache()
       return json(200, {
         rows: res.rows.slice(0, 2000),
@@ -315,6 +331,21 @@ export class AdminApi {
       // needed for the role path as well, not just the plain one.
       await this.db.resetSession().catch(() => {})
     }
+  }
+
+  /**
+   * Run a multi-statement script and return the last command's result, the way
+   * psql and the Supabase SQL editor both report a script.
+   *
+   * Prefers the engine's single-round-trip simple-query path; an engine without
+   * one still works, just one statement per round trip.
+   */
+  private async runScript(sql: string, statements: string[]): Promise<EngineResults> {
+    const viaEngine = await this.db.execMany(sql)
+    if (viaEngine) return viaEngine.at(-1) ?? { rows: [] }
+    let last: EngineResults = { rows: [] }
+    for (const stmt of statements) last = await this.db.query(stmt)
+    return last
   }
 
   /** List user-visible schema names (excluding the Postgres catalog schemas). */

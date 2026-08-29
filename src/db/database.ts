@@ -173,6 +173,14 @@ export class Database {
   }
 
   /**
+   * Run a multi-statement script, returning one result per statement.
+   * Undefined when the engine has no multi-statement path.
+   */
+  execMany(sql: string): Promise<EngineResults[]> | undefined {
+    return this.engine.execMany?.(sql)
+  }
+
+  /**
    * Run `fn` inside a transaction with the request's Postgres role and JWT
    * claims applied via SET LOCAL - this is what makes RLS behave exactly
    * like hosted Supabase.
