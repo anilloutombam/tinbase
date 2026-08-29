@@ -41,6 +41,12 @@ export async function buildWireEngine(opts: WireEngineOptions): Promise<DbEngine
     exec(sql: string): Promise<void> {
       return mutex.run(() => tx.exec(sql))
     },
+    execMany(sql: string): Promise<EngineResults[]> {
+      // simple query protocol - one result set per command in the script
+      return mutex.run(async () =>
+        (await main.exec(sql)).map((r) => ({ rows: r.rows, affectedRows: r.affectedRows }))
+      )
+    },
     transaction<T>(fn: (t: EngineTx) => Promise<T>): Promise<T> {
       return mutex.run(async () => {
         await main.exec('begin')
