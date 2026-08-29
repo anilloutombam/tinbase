@@ -24,7 +24,10 @@ jobs:
       - name: Tests (native engine)
         run: TINBASE_TEST_ENGINE=native npm test
 
-  # Keep this job non-blocking while known parity gaps remain.
+  # Informational: the harness reports the conformance score and exits 0, so a
+  # red X here means the comparison itself broke (stack won't start, harness
+  # threw), not that a known gap is still open. Kept non-blocking because the
+  # job depends on pulling the whole Supabase docker stack.
   parity-supabase:
     runs-on: ubuntu-latest
     continue-on-error: true
