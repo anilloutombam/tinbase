@@ -110,11 +110,14 @@ export class RestHandler {
       // (grants still apply) - that's what powers cross-schema browsing in the
       // studio, mirroring Supabase's privileged pg-meta connection.
       if (!this.exposedSchemas.includes(schema) && ctx.role !== 'service_role') {
+        // Match PostgREST's wording exactly: it names the rejected schema in the
+        // message and lists the allowed ones in the hint. Clients that match on
+        // the text rather than the code see the same strings as hosted Supabase.
         return jsonResponse(406, {
           code: 'PGRST106',
-          message: `The schema must be one of the following: ${this.exposedSchemas.join(', ')}`,
+          message: `Invalid schema: ${schema}`,
           details: null,
-          hint: null,
+          hint: `Only the following schemas are exposed: ${this.exposedSchemas.join(', ')}`,
         })
       }
 

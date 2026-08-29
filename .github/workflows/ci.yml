@@ -50,6 +50,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/parity-project/supabase/migrations"
           supabase init --workdir "$RUNNER_TEMP/parity-project" --force
           cp parity/schema.sql "$RUNNER_TEMP/parity-project/supabase/migrations/20240101000000_parity.sql"
+          # Expose the same schemas tinbase does. Supabase ships graphql_public
+          # because it runs pg_graphql; tinbase has no GraphQL, so leaving the
+          # default in place would compare deployment config, not behaviour.
+          sed -i 's/^schemas = .*/schemas = ["public"]/' \
+            "$RUNNER_TEMP/parity-project/supabase/config.toml"
+          grep -n '^schemas' "$RUNNER_TEMP/parity-project/supabase/config.toml"
       - name: Start real Supabase stack
         run: |
           supabase start --workdir "$RUNNER_TEMP/parity-project" \
