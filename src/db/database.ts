@@ -109,7 +109,10 @@ export class Database {
   private cdcListeners = new Set<(e: CdcEvent) => void>()
   private cdcStarted = false
 
-  private constructor(public engine: DbEngine) {}
+  private constructor(
+    public engine: DbEngine,
+    private vaultKey?: string
+  ) {}
 
   /** Create a Database on PGlite (default) or any custom DbEngine. */
   static async create(dataDirOrEngine?: string | DbEngine, opts?: { vaultKey?: string }): Promise<Database> {
@@ -135,7 +138,28 @@ export class Database {
         await engine.query(`select set_config('app.settings.vault_key', $1, false)`, [opts.vaultKey])
       }
     }
-    return new Database(engine)
+    return new Database(engine, opts?.vaultKey)
+  }
+
+  /**
+   * Return the shared connection to a clean session state.
+   *
+   * Everything in tinbase runs over one long-lived connection, so a bare `SET`
+   * from an ad-hoc query (`/admin/v1/sql`) would otherwise persist into every
+   * later request, and into every other client. The case that makes this more
+   * than cosmetic is `session_replication_role = 'replica'`, which silently
+   * disables foreign-key and trigger enforcement for everyone until restart.
+   *
+   * `reset all` clears custom GUCs too, which would take the vault key with it
+   * (it lives only in this session, never in a table), so re-apply it after.
+   */
+  async resetSession(): Promise<void> {
+    // subset engines (pg-mem) have no session GUCs to leak and no RESET support
+    if (this.engine.minimalBootstrap) return
+    await this.engine.exec('reset all; reset role;')
+    if (this.vaultKey) {
+      await this.engine.query(`select set_config('app.settings.vault_key', $1, false)`, [this.vaultKey])
+    }
   }
 
   /** Superuser query - used by auth/storage internals and introspection. */

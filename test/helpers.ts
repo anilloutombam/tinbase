@@ -75,16 +75,23 @@ export interface TestEnv {
   close: () => Promise<void>
 }
 
-export async function createTestEnv(): Promise<TestEnv> {
+/**
+ * The engine the suite is running on, or undefined for the default (PGlite).
+ * Tests that build their own backend should use this, otherwise they silently
+ * stay on PGlite even under TINBASE_TEST_ENGINE=native.
+ */
+export async function testEngine() {
   // TINBASE_TEST_ENGINE=native runs the whole suite on embedded Postgres
-  let engine
-  if (process.env.TINBASE_TEST_ENGINE === 'native') {
-    const { createNativeEngine } = await import('../src/node/native/engine.js')
-    const { mkdtempSync } = await import('node:fs')
-    const { tmpdir } = await import('node:os')
-    const { join } = await import('node:path')
-    engine = await createNativeEngine({ dataDir: join(mkdtempSync(join(tmpdir(), 'tinbase-test-')), 'pgdata') })
-  }
+  if (process.env.TINBASE_TEST_ENGINE !== 'native') return undefined
+  const { createNativeEngine } = await import('../src/node/native/engine.js')
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  return await createNativeEngine({ dataDir: join(mkdtempSync(join(tmpdir(), 'tinbase-test-')), 'pgdata') })
+}
+
+export async function createTestEnv(): Promise<TestEnv> {
+  const engine = await testEngine()
 
   const backend = await createBackend({
     engine,

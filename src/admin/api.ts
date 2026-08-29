@@ -308,6 +308,12 @@ export class AdminApi {
       })
     } catch (e) {
       return adminError(e)
+    } finally {
+      // The SQL editor runs arbitrary statements on the shared connection, so a
+      // bare `SET` here would leak into every later request and every other
+      // client. A `SET` inside a transaction survives commit too, so this is
+      // needed for the role path as well, not just the plain one.
+      await this.db.resetSession().catch(() => {})
     }
   }
 
