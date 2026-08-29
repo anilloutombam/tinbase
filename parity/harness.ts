@@ -34,6 +34,11 @@ function normalize(value: unknown): unknown {
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const k of Object.keys(value as object).sort()) {
+      // HTTP reason phrase, not behaviour: tinbase answers in-process and
+      // leaves it empty, real supabase comes over the wire and says "OK".
+      // Comparing it reports a mismatch on responses that are otherwise
+      // byte-identical, which buries the genuine gaps.
+      if (k === 'statusText') continue
       // error objects: keep only the stable, meaningful fields
       out[k] = normalize((value as Record<string, unknown>)[k])
     }

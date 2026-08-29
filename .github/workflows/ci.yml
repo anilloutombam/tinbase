@@ -37,19 +37,30 @@ jobs:
           cache: npm
       - uses: supabase/setup-cli@v2
         with:
-          version: latest
+          # pinned so a CLI release can't change what this job measures
+          version: 2.116.0
       - run: npm ci
+      # The comparison stack lives outside the checkout on purpose. Running
+      # `supabase init` in the repo root picks up the project's own
+      # supabase/migrations, which get applied alongside the parity schema and
+      # collide with it (its policies assume a different posts.author_id type),
+      # so the stack never starts and the job reports nothing.
       - name: Prepare parity project
         run: |
-          supabase init
-          mkdir -p supabase/migrations
-          cp parity/schema.sql supabase/migrations/20240101000000_parity.sql
+          mkdir -p "$RUNNER_TEMP/parity-project/supabase/migrations"
+          supabase init --workdir "$RUNNER_TEMP/parity-project" --force
+          cp parity/schema.sql "$RUNNER_TEMP/parity-project/supabase/migrations/20240101000000_parity.sql"
       - name: Start real Supabase stack
-        run: supabase start -x studio,imgproxy,edge-runtime,logflare,vector,supavisor,postgres-meta
+        run: |
+          supabase start --workdir "$RUNNER_TEMP/parity-project" \
+            -x studio,imgproxy,edge-runtime,logflare,vector,supavisor,postgres-meta
       - name: Compare tinbase with Supabase
         run: |
-          eval "$(supabase status -o env)"
+          eval "$(supabase status --workdir "$RUNNER_TEMP/parity-project" -o env)"
           SUPABASE_URL="$API_URL" \
           SUPABASE_ANON_KEY="$ANON_KEY" \
           SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" \
           npm run parity -- --compare
+      - name: Stop the stack
+        if: always()
+        run: supabase stop --workdir "$RUNNER_TEMP/parity-project" --no-backup || true
