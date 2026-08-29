@@ -72,6 +72,11 @@ describe('schema allowlist (default: public only)', () => {
     expect(data).toBeNull()
     expect(error).not.toBeNull()
     expect(error!.code).toBe('PGRST106')
+    // PostgREST's exact wording: the message names the rejected schema, the
+    // hint lists the allowed ones. Verified against a real supabase stack by
+    // the parity comparison.
+    expect(error!.message).toBe('Invalid schema: private_s')
+    expect(error!.hint).toBe('Only the following schemas are exposed: public')
   })
 
   it('service_role bypasses the allowlist and reaches the unexposed schema', async () => {
