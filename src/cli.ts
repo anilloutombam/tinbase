@@ -440,6 +440,9 @@ Email (env):
   TINBASE_MAIL_FROM       sender for Resend, e.g. "My App <noreply@example.com>"
   TINBASE_SITE_URL        public URL emailed links are built on (overrides
                           config.toml auth.site_url and the bound address)
+  TINBASE_URI_ALLOW_LIST  comma-separated redirect targets to allow in addition
+                          to config.toml auth.additional_redirect_urls (globs,
+                          e.g. https://app.example.com/**)
       --memory          in-memory database (no persistence, wasm engine only)
       --engine <e>      native (embedded Postgres, default on macOS/Linux),
                         wasm (PGlite - default on Windows, browser-ready), or
@@ -687,6 +690,20 @@ async function main(): Promise<void> {
 
   const siteUrl = process.env.TINBASE_SITE_URL || cfg.auth.siteUrl || `http://${opts.host}:${port}`
 
+  // Allowed redirect targets for emailed links, merged from two sources: the
+  // project's own `additional_redirect_urls`, and TINBASE_URI_ALLOW_LIST, which
+  // a platform sets to the origins it already knows this project is served on.
+  // Both are needed: the allowlist is enforced once bound to a network-exposed
+  // host, and a project deployed behind a platform cannot be expected to list
+  // hostnames the platform minted for it.
+  const uriAllowList = [
+    ...(process.env.TINBASE_URI_ALLOW_LIST ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    ...(cfg.auth.uriAllowList ?? []),
+  ]
+
   const backend = await createBackend({
     engine,
     databaseUrl: opts.databaseUrl,
@@ -700,7 +717,7 @@ async function main(): Promise<void> {
     siteUrl,
     host: opts.host,
     jwtExpiry: cfg.auth.jwtExpiry,
-    uriAllowList: cfg.auth.uriAllowList,
+    uriAllowList,
     authEnabled: cfg.auth.enabled,
     authSettings: cfg.auth.settings,
     authRateLimits: cfg.auth.rateLimits,
@@ -750,6 +767,7 @@ async function main(): Promise<void> {
           Admin UI: ${server.url}/_/
              Email: ${mailer ? `Resend (from ${mailFrom})` : `dev inbox at ${server.url}/inbox (not delivered)`}
           Site URL: ${siteUrl}
+    Redirects to: ${uriAllowList.length ? uriAllowList.join(', ') : 'the site URL origin only'}
             Engine: ${opts.engine === 'native' ? `native postgres (${dataDir})` : opts.engine === 'pgmem' ? 'pg-mem (in-memory, lite)' : `PGlite (${opts.memory ? 'in-memory' : dataDir})`}
            Storage: ${opts.storageDir}
         Migrations: ${project.migrations.length} file(s)

@@ -4,6 +4,16 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [Unreleased]
+
+### Added
+- **`TINBASE_URI_ALLOW_LIST`.** Comma-separated redirect targets, merged with `config.toml`
+  `auth.additional_redirect_urls`. The allowlist is enforced once tinbase binds a
+  network-exposed host, so a project deployed behind a platform could not have its emailed
+  links reach its own app: the platform mints the hostnames, and nothing in the project's
+  committed config knows them. The startup banner now also prints the resolved list, since
+  "the link went to the wrong page" is otherwise invisible.
+
 ## [0.15.0]
 
 ### Added
