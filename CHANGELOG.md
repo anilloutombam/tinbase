@@ -7,6 +7,14 @@ All notable changes to tinbase are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Resend delivery for auth emails.** Set `TINBASE_RESEND_API_KEY` and `TINBASE_MAIL_FROM`
+  (`"My App <noreply@example.com>"`) and magic links, OTP codes and password-recovery mails go
+  out through Resend; the unauthenticated dev `/inbox` is then not mounted. Without the key the
+  inbox stays, as before — but the startup banner now says so ("not delivered"), because a
+  network-exposed server on the inbox silently drops every reset email. A key without a valid
+  sender is a startup error. `TINBASE_SITE_URL` sets the public URL emailed links are built on,
+  ahead of `config.toml` `auth.site_url` and the bound address — inside a container the latter
+  is meaningless to a user's mail client.
 - **PKCE for email links.** A `flowType: 'pkce'` client (the default in Supabase's SSR /
   Next.js helpers) sends `code_challenge` with `/recover`, `/otp`, `/magiclink`, `/resend`
   and `/signup`. The challenge is parked in `auth.flow_state` (`provider = 'email'`, as

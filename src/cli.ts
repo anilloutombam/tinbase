@@ -16,6 +16,7 @@ import { attachNativeEngine, createNativeEngine, readRunningPostmaster } from '.
 import type { DbEngine } from './db/engine.js'
 import { readServerLock, removeServerLock, writeServerLock, type ServerLock } from './node/server-lock.js'
 import { FsStorageDriver } from './node/fs-driver.js'
+import { ResendMailer } from './auth/resend.js'
 import { loadProjectConfig } from './node/load-config.js'
 import { loadFunctions, loadFunctionEnv } from './node/load-functions.js'
 import { loadSupabaseProject } from './node/project.js'
@@ -432,6 +433,13 @@ Options:
                         for the native engine, <dir>/.tinbase/db for wasm)
       --storage-dir <p> storage files directory (default <dir>/.tinbase/storage)
       --jwt-secret <s>  JWT secret (or TINBASE_JWT_SECRET env var)
+
+Email (env):
+  TINBASE_RESEND_API_KEY  deliver auth emails through Resend; without it they land
+                          in the dev inbox at /inbox and are never sent
+  TINBASE_MAIL_FROM       sender for Resend, e.g. "My App <noreply@example.com>"
+  TINBASE_SITE_URL        public URL emailed links are built on (overrides
+                          config.toml auth.site_url and the bound address)
       --memory          in-memory database (no persistence, wasm engine only)
       --engine <e>      native (embedded Postgres, default on macOS/Linux),
                         wasm (PGlite - default on Windows, browser-ready), or
@@ -654,15 +662,42 @@ async function main(): Promise<void> {
     port = free
   }
 
+  // Outgoing auth email. With TINBASE_RESEND_API_KEY set, mail goes out through
+  // Resend and the dev /inbox is not mounted (it is unauthenticated and would
+  // expose every reset link). Without it, the in-memory inbox stays - right for
+  // local dev, wrong for anything reachable by real users, so the banner says
+  // which one is active. The key alone is not enough: Resend needs a verified
+  // sender, so a missing/invalid TINBASE_MAIL_FROM is a startup error rather
+  // than a silently dropped email later.
+  const resendApiKey = process.env.TINBASE_RESEND_API_KEY
+  const mailFrom = process.env.TINBASE_MAIL_FROM
+  let mailer: ResendMailer | undefined
+  if (resendApiKey) {
+    if (!mailFrom) {
+      console.error('TINBASE_RESEND_API_KEY is set but TINBASE_MAIL_FROM is not (e.g. "My App <noreply@example.com>")')
+      process.exit(1)
+    }
+    try {
+      mailer = new ResendMailer({ apiKey: resendApiKey, from: mailFrom })
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e))
+      process.exit(1)
+    }
+  }
+
+  const siteUrl = process.env.TINBASE_SITE_URL || cfg.auth.siteUrl || `http://${opts.host}:${port}`
+
   const backend = await createBackend({
     engine,
     databaseUrl: opts.databaseUrl,
     dataDir: opts.engine === 'native' ? undefined : dataDir,
     jwtSecret: opts.jwtSecret,
-    // config.toml's site_url is what a real project uses for emailed links and
-    // redirects; fall back to the bound address when it's not set. (The server
-    // still binds to --host:--port regardless.)
-    siteUrl: cfg.auth.siteUrl ?? `http://${opts.host}:${port}`,
+    mailer,
+    // The public URL emailed links and redirects are built on. TINBASE_SITE_URL
+    // wins (a platform injects the workload's public route - the bound address
+    // inside a container is meaningless to a user's mail client), then
+    // config.toml's site_url, then the bound address for plain local dev.
+    siteUrl,
     host: opts.host,
     jwtExpiry: cfg.auth.jwtExpiry,
     uriAllowList: cfg.auth.uriAllowList,
@@ -712,7 +747,9 @@ async function main(): Promise<void> {
   tinbase running
 
            API URL: ${server.url}
-          Admin UI: ${server.url}/_/${backend.inbox ? `\n       Email inbox: ${server.url}/inbox` : ''}
+          Admin UI: ${server.url}/_/
+             Email: ${mailer ? `Resend (from ${mailFrom})` : `dev inbox at ${server.url}/inbox (not delivered)`}
+          Site URL: ${siteUrl}
             Engine: ${opts.engine === 'native' ? `native postgres (${dataDir})` : opts.engine === 'pgmem' ? 'pg-mem (in-memory, lite)' : `PGlite (${opts.memory ? 'in-memory' : dataDir})`}
            Storage: ${opts.storageDir}
         Migrations: ${project.migrations.length} file(s)
