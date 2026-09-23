@@ -4,7 +4,7 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
-## [Unreleased]
+## [0.15.0]
 
 ### Added
 - **Resend delivery for auth emails.** Set `TINBASE_RESEND_API_KEY` and `TINBASE_MAIL_FROM`
