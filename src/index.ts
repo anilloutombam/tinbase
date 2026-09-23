@@ -26,7 +26,7 @@ import { WebhooksService, type WebhookDelivery } from './webhooks/service.js'
 import { CronService } from './cron/service.js'
 import { NetService, type NetDelivery } from './net/service.js'
 import { RetentionService } from './retention/service.js'
-import { DEFAULT_JWT_SECRET, type BackendConfig, type Mailer, type MigrationFile, type RequestContext } from './types.js'
+import { DEFAULT_JWT_SECRET, type BackendConfig, type MailMessage, type Mailer, type MigrationFile, type RequestContext } from './types.js'
 import { assertSecretsSafe, isNetworkExposed } from './security.js'
 
 export * from './types.js'
@@ -200,22 +200,36 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
 
   const rest = new RestHandler(db, { exposedSchemas: config.dbSchemas, maxRows: config.maxRows })
   // With no custom mailer, capture auth emails in an in-memory inbox (viewable
-  // at /inbox) and log a metadata-only line. A provided mailer takes over and no
-  // inbox is mounted.
+  // at /inbox). A provided mailer takes over and no inbox is mounted.
   //
   // The server log records only the recipient and subject - never the body,
   // which carries OTP codes and magic links. Set logMailBody: true to also log
   // the full body for local debugging (the /inbox UI always shows it in full).
-  const inbox = config.mailer
-    ? null
-    : new InboxMailer((msg) =>
-        log(
-          config.logMailBody
-            ? `[mail] to=${msg.to} subject="${msg.subject}"\n${msg.text}`
-            : `[mail] to=${msg.to} subject="${msg.subject}"`
-        )
-      )
-  const mailer: Mailer = config.mailer ?? inbox!
+  const logMail = (msg: MailMessage) =>
+    log(
+      config.logMailBody
+        ? `[mail] to=${msg.to} subject="${msg.subject}"\n${msg.text}`
+        : `[mail] to=${msg.to} subject="${msg.subject}"`
+    )
+  const inbox = config.mailer ? null : new InboxMailer(logMail)
+  // Every send is logged, whichever transport is in use, and a failure is
+  // logged with its reason. Only the dev inbox used to log, so on a real
+  // deployment - the one case where you cannot look in /inbox - there was no
+  // evidence that a password-reset mail had been sent at all, and a transport
+  // that rejected it said so only in the HTTP response to the end user.
+  const mailer: Mailer = config.mailer
+    ? {
+        send: async (msg) => {
+          try {
+            await config.mailer!.send(msg)
+          } catch (e) {
+            log(`[mail] FAILED to=${msg.to} subject="${msg.subject}": ${e instanceof Error ? e.message : String(e)}`)
+            throw e
+          }
+          logMail(msg)
+        },
+      }
+    : inbox!
   // one shared runtime-settings object: config.toml [auth] provides the
   // committed defaults, the persisted auth.config row layers live studio edits
   // on top, and the auth handler reads the merged object per request

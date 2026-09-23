@@ -4,6 +4,16 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [Unreleased]
+
+### Fixed
+- **Auth mail is logged whatever the transport.** Only the dev inbox logged a line, so on a
+  real deployment — the one case where `/inbox` is not even mounted — nothing recorded that a
+  password-reset mail had been sent, and a transport that rejected it (an unverified sender
+  domain, say) reported that only in the HTTP response to the end user. Every send now logs
+  `[mail] to=… subject="…"`, and a failure logs `[mail] FAILED …` with the reason before the
+  error propagates. The body, which carries the link and the OTP, is still never logged.
+
 ## [0.15.1]
 
 ### Added
