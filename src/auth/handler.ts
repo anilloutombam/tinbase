@@ -74,6 +74,21 @@ function authError(status: number, errorCode: string, msg: string): Response {
   return json(status, { code: status, error_code: errorCode, msg })
 }
 
+/**
+ * The per-request inputs supabase-js attaches to an email-sending call.
+ *
+ * `redirectTo` is the `?redirect_to=` query param set by `emailRedirectTo` /
+ * `resetPasswordForEmail(email, { redirectTo })`. `codeChallenge` and
+ * `codeChallengeMethod` are the body fields a `flowType: 'pkce'` client
+ * sends; their presence is what selects the PKCE variant of the link.
+ */
+interface EmailFlowOptions {
+  flavor?: 'login' | 'confirm'
+  redirectTo?: string | null
+  codeChallenge?: string | null
+  codeChallengeMethod?: string | null
+}
+
 /** A cryptographically-random numeric OTP of `length` digits (6-10). */
 function randomOtp(length: number): string {
   const n = Math.max(6, Math.min(10, Math.floor(length)))
@@ -161,15 +176,15 @@ export class AuthHandler {
           minimum_password_length: this.settings.minPasswordLength,
         })
       }
-      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req))
+      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req, url))
       if (path === 'token' && method === 'POST') return this.limit('token', req) ?? (await this.token(req, url))
       if (path === 'user' && method === 'GET') return await this.getUser(req)
       if (path === 'user' && method === 'PUT') return await this.updateUser(req)
       if (path === 'logout' && method === 'POST') return await this.logout(req)
-      if (path === 'otp' && method === 'POST') return this.limit('otp', req) ?? (await this.sendOtp(req))
-      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req))
+      if (path === 'otp' && method === 'POST') return this.limit('otp', req) ?? (await this.sendOtp(req, url))
+      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req, url))
       if (['magiclink', 'resend'].includes(path) && method === 'POST')
-        return this.limit('otp', req) ?? (await this.sendOtp(req))
+        return this.limit('otp', req) ?? (await this.sendOtp(req, url))
       if (path === 'verify' && method === 'POST') return await this.verifyToken(req)
       if (path === 'verify' && method === 'GET') return await this.verifyLink(url)
       if (path === 'factors' && method === 'POST') return await this.enrollFactor(req)
@@ -199,11 +214,13 @@ export class AuthHandler {
 
   // ── flows ─────────────────────────────────────────────────────────────
 
-  private async signup(req: Request): Promise<Response> {
+  private async signup(req: Request, url: URL): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as {
       email?: string
       password?: string
       data?: Record<string, unknown>
+      code_challenge?: string
+      code_challenge_method?: string
     }
 
     if (!body.email && !body.password) {
@@ -258,7 +275,11 @@ export class AuthHandler {
     await this.audit('user_signedup', { actorId: newUser.id, actorEmail: email })
     if (!autoconfirm) {
       // confirmation required: email a verification link/code; no session yet
-      await this.issueToken(email, 'otp', false, 'confirm')
+      await this.issueToken(email, 'otp', false, {
+        flavor: 'confirm',
+        redirectTo: url.searchParams.get('redirect_to'),
+        ...AuthHandler.pkceFrom(body),
+      })
       return json(200, this.userJson(newUser))
     }
     return json(200, await this.sessionFor(newUser))
@@ -468,18 +489,54 @@ export class AuthHandler {
     return { user, code, linkToken }
   }
 
+  /** Pull the PKCE fields out of a request body, or nothing when the client is on the implicit flow. */
+  private static pkceFrom(body: { code_challenge?: string; code_challenge_method?: string }): Pick<EmailFlowOptions, 'codeChallenge' | 'codeChallengeMethod'> {
+    return { codeChallenge: body.code_challenge ?? null, codeChallengeMethod: body.code_challenge_method ?? null }
+  }
+
+  /**
+   * Mint a one-time token for `email` and mail the link + code.
+   *
+   * GoTrue bakes `redirect_to` into the emailed link so that clicking it lands
+   * the user on the app's own screen (e.g. `/reset-password`); omitting it
+   * would send every link to the bare site URL instead. It goes through the
+   * same allow-list as {@link verifyLink} so a request can't mint a link that
+   * redirects to an origin the operator hasn't allowed.
+   *
+   * With a PKCE challenge, the challenge is parked in `auth.flow_state` under
+   * the link token (GoTrue does the same, `provider = 'email'`). Clicking the
+   * link then yields `?code=` for `exchangeCodeForSession` instead of putting
+   * the session tokens in the URL fragment - see {@link verifyLink}. The
+   * 6-digit code path (`verifyOtp`) is unaffected: it returns a session
+   * directly in both flows, as in GoTrue.
+   */
   private async issueToken(
     email: string,
     tokenType: 'otp' | 'recovery',
     createUser: boolean,
-    flavor: 'login' | 'confirm' = 'login'
+    opts: EmailFlowOptions = {}
   ): Promise<Response> {
+    const flavor = opts.flavor ?? 'login'
     const minted = await this.mintOneTimeToken(email, tokenType, createUser)
     if ('error' in minted) return minted.error
     const { code, linkToken } = minted
     const normalized = email.toLowerCase().trim()
     const kind = tokenType === 'otp' ? 'magiclink' : tokenType
-    const link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
+    let link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
+    const redirectTo = resolveRedirect(
+      opts.redirectTo,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    if (opts.redirectTo) link += `&redirect_to=${encodeURIComponent(redirectTo)}`
+    if (opts.codeChallenge) {
+      await this.db.query(
+        `insert into auth.flow_state (provider, provider_state, redirect_to, code_challenge, code_challenge_method, expires_at)
+         values ('email', $1, $2, $3, $4, now() + $5::interval)`,
+        [linkToken, redirectTo, opts.codeChallenge, opts.codeChallengeMethod, `${this.settings.otpExpirySeconds} seconds`]
+      )
+    }
     await this.config.mailer.send({
       to: normalized,
       subject: tokenType === 'recovery' ? 'Reset your password' : flavor === 'confirm' ? 'Confirm your email' : 'Your login code',
@@ -493,16 +550,37 @@ export class AuthHandler {
     return json(200, {})
   }
 
-  private async sendOtp(req: Request): Promise<Response> {
-    const body = (await req.json().catch(() => ({}))) as { email?: string; create_user?: boolean }
+  private async sendOtp(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      create_user?: boolean
+      code_challenge?: string
+      code_challenge_method?: string
+    }
     if (!body.email) return authError(400, 'validation_failed', 'email is required')
-    return this.issueToken(body.email, 'otp', body.create_user !== false)
+    return this.issueToken(body.email, 'otp', body.create_user !== false, {
+      redirectTo: url.searchParams.get('redirect_to'),
+      ...AuthHandler.pkceFrom(body),
+    })
   }
 
-  private async sendRecovery(req: Request): Promise<Response> {
-    const body = (await req.json().catch(() => ({}))) as { email?: string }
+  private async sendRecovery(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      code_challenge?: string
+      code_challenge_method?: string
+    }
     if (!body.email) return authError(400, 'validation_failed', 'email is required')
-    return this.issueToken(body.email, 'recovery', false)
+    // GoTrue answers 200 for an address it has never seen, so the response
+    // can't be used to enumerate which emails have accounts. supabase-js apps
+    // rely on this to show "check your inbox" unconditionally.
+    const normalized = body.email.toLowerCase().trim()
+    const existing = await this.db.query(`select 1 from auth.users where email = $1`, [normalized])
+    if (existing.rows.length === 0) return json(200, {})
+    return this.issueToken(body.email, 'recovery', false, {
+      redirectTo: url.searchParams.get('redirect_to'),
+      ...AuthHandler.pkceFrom(body),
+    })
   }
 
   /** Max wrong guesses for a one-time code before its tokens are invalidated. */
@@ -575,6 +653,9 @@ export class AuthHandler {
     if (!token) return authError(400, 'validation_failed', 'token is required')
     const user = await this.redeem(token, AuthHandler.redeemTypes(body.type), body.email)
     if (!user) return authError(403, 'otp_expired', 'Token has expired or is invalid')
+    // A PKCE challenge parked for the link is moot once the code was typed in
+    // instead; drop it so nothing is left to redeem.
+    await this.db.query(`delete from auth.flow_state where provider = 'email' and provider_state = $1`, [token])
     return json(200, await this.sessionFor(user))
   }
 
@@ -594,6 +675,27 @@ export class AuthHandler {
     if (!user) {
       return new Response(null, { status: 303, headers: { location: `${redirectTo}#error=access_denied&error_code=otp_expired` } })
     }
+
+    // PKCE: the request that sent this email parked a code_challenge under the
+    // link token. Hand back a one-shot auth code (redirect_to?code=...) for
+    // POST /token?grant_type=pkce - the same exchange OAuth uses - instead of
+    // exposing the session tokens in the URL. supabase-js remembers which flow
+    // (recovery vs. magic link) it started, so no `type` is needed here.
+    const flow = await this.db.query(
+      `delete from auth.flow_state where provider = 'email' and provider_state = $1 returning code_challenge, code_challenge_method`,
+      [token]
+    )
+    const pkce = flow.rows[0] as { code_challenge: string | null; code_challenge_method: string | null } | undefined
+    if (pkce?.code_challenge) {
+      const authCode = randomToken(24)
+      await this.db.query(
+        `insert into auth.flow_state (provider, provider_state, redirect_to, code_challenge, code_challenge_method, auth_code, user_id, expires_at)
+         values ('email', $1, $2, $3, $4, $5, $6, now() + interval '5 minutes')`,
+        [randomToken(16), redirectTo, pkce.code_challenge, pkce.code_challenge_method, authCode, user.id]
+      )
+      return new Response(null, { status: 303, headers: { location: `${redirectTo}?code=${authCode}` } })
+    }
+
     const session = (await this.sessionFor(user)) as { access_token: string; refresh_token: string; expires_in: number }
     const hash = `#access_token=${session.access_token}&refresh_token=${session.refresh_token}&expires_in=${session.expires_in}&token_type=bearer&type=${type}`
     return new Response(null, { status: 303, headers: { location: `${redirectTo}${hash}` } })

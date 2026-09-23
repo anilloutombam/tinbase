@@ -4,6 +4,30 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [Unreleased]
+
+### Added
+- **PKCE for email links.** A `flowType: 'pkce'` client (the default in Supabase's SSR /
+  Next.js helpers) sends `code_challenge` with `/recover`, `/otp`, `/magiclink`, `/resend`
+  and `/signup`. The challenge is parked in `auth.flow_state` (`provider = 'email'`, as
+  GoTrue does) and `GET /verify` then redirects to `redirect_to?code=…` for
+  `exchangeCodeForSession` — the existing `POST /token?grant_type=pkce` exchange OAuth
+  already uses — instead of putting the session tokens in the URL fragment. Previously the
+  challenge was ignored, the client received a hash it wasn't expecting, and password
+  recovery / magic links silently failed on PKCE clients. `verifyOtp` with the typed code
+  is unchanged and returns a session directly in both flows.
+
+### Fixed
+- **Auth emails now honour `redirectTo`.** `resetPasswordForEmail(email, { redirectTo })`,
+  `signInWithOtp({ options: { emailRedirectTo } })` and `signUp({ options: { emailRedirectTo } })`
+  send the target as `?redirect_to=` on `/recover`, `/otp`, `/magiclink`, `/resend` and
+  `/signup`. It was silently ignored, so every emailed link redirected to the bare site URL
+  and a "forgot password" screen at `/reset-password` was never reached. The link now carries
+  `redirect_to` (checked against the same allow-list `GET /verify` enforces), matching GoTrue.
+- **`POST /recover` for an unknown email returns `200 {}`** instead of `422 otp_disabled`,
+  as GoTrue does, so the response cannot be used to enumerate which addresses have accounts
+  and apps can show "check your inbox" unconditionally.
+
 ## [0.14.0]
 
 ### Added
