@@ -72,8 +72,39 @@ describe('otp / magic links / recovery', () => {
     await supabase.auth.signOut()
   })
 
-  it('recovery for unknown email does not create a user', async () => {
+  it('recovery for unknown email answers 200 without mailing or creating a user', async () => {
+    // GoTrue parity: the response must not reveal whether the address has an account
+    const before = outbox.length
     const { error } = await supabase.auth.resetPasswordForEmail('ghost@example.com')
-    expect(error).not.toBeNull()
+    expect(error).toBeNull()
+    expect(outbox.length).toBe(before)
+    const login = await supabase.auth.signInWithOtp({ email: 'ghost@example.com', options: { shouldCreateUser: false } })
+    expect(login.error).not.toBeNull()
+  })
+
+  it('recovery link carries redirectTo and lands there with a recovery session', async () => {
+    await supabase.auth.signUp({ email: 'redirect@example.com', password: 'oldpassword1' })
+    await supabase.auth.signOut()
+
+    const { error } = await supabase.auth.resetPasswordForEmail('redirect@example.com', {
+      redirectTo: 'http://app.local/reset-password',
+    })
+    expect(error).toBeNull()
+    const link = lastLink()!
+    expect(link).toContain(`redirect_to=${encodeURIComponent('http://app.local/reset-password')}`)
+
+    const res = await backend.fetch(new Request(link, { redirect: 'manual' }))
+    expect(res.status).toBe(303)
+    const location = res.headers.get('location')!
+    expect(location).toContain('http://app.local/reset-password#access_token=')
+    expect(location).toContain('type=recovery')
+  })
+
+  it('signup confirmation and magic-link emails carry emailRedirectTo', async () => {
+    await supabase.auth.signInWithOtp({
+      email: 'otp-redirect@example.com',
+      options: { emailRedirectTo: 'http://app.local/welcome' },
+    })
+    expect(lastLink()).toContain(`redirect_to=${encodeURIComponent('http://app.local/welcome')}`)
   })
 })

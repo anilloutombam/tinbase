@@ -161,15 +161,15 @@ export class AuthHandler {
           minimum_password_length: this.settings.minPasswordLength,
         })
       }
-      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req))
+      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req, url))
       if (path === 'token' && method === 'POST') return this.limit('token', req) ?? (await this.token(req, url))
       if (path === 'user' && method === 'GET') return await this.getUser(req)
       if (path === 'user' && method === 'PUT') return await this.updateUser(req)
       if (path === 'logout' && method === 'POST') return await this.logout(req)
-      if (path === 'otp' && method === 'POST') return this.limit('otp', req) ?? (await this.sendOtp(req))
-      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req))
+      if (path === 'otp' && method === 'POST') return this.limit('otp', req) ?? (await this.sendOtp(req, url))
+      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req, url))
       if (['magiclink', 'resend'].includes(path) && method === 'POST')
-        return this.limit('otp', req) ?? (await this.sendOtp(req))
+        return this.limit('otp', req) ?? (await this.sendOtp(req, url))
       if (path === 'verify' && method === 'POST') return await this.verifyToken(req)
       if (path === 'verify' && method === 'GET') return await this.verifyLink(url)
       if (path === 'factors' && method === 'POST') return await this.enrollFactor(req)
@@ -199,7 +199,7 @@ export class AuthHandler {
 
   // ── flows ─────────────────────────────────────────────────────────────
 
-  private async signup(req: Request): Promise<Response> {
+  private async signup(req: Request, url: URL): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as {
       email?: string
       password?: string
@@ -258,7 +258,7 @@ export class AuthHandler {
     await this.audit('user_signedup', { actorId: newUser.id, actorEmail: email })
     if (!autoconfirm) {
       // confirmation required: email a verification link/code; no session yet
-      await this.issueToken(email, 'otp', false, 'confirm')
+      await this.issueToken(email, 'otp', false, 'confirm', url.searchParams.get('redirect_to'))
       return json(200, this.userJson(newUser))
     }
     return json(200, await this.sessionFor(newUser))
@@ -468,18 +468,39 @@ export class AuthHandler {
     return { user, code, linkToken }
   }
 
+  /**
+   * Mint a one-time token for `email` and mail the link + code.
+   *
+   * `redirectTo` is the `?redirect_to=` supabase-js puts on the request for
+   * `emailRedirectTo` / `resetPasswordForEmail(email, { redirectTo })`. GoTrue
+   * bakes it into the emailed link so that clicking it lands the user on the
+   * app's own screen (e.g. `/reset-password`) with the session in the hash;
+   * omitting it here would send every link to the bare site URL instead.
+   * It goes through the same allow-list as {@link verifyLink} so a request
+   * can't mint a link that redirects to an origin the operator hasn't allowed.
+   */
   private async issueToken(
     email: string,
     tokenType: 'otp' | 'recovery',
     createUser: boolean,
-    flavor: 'login' | 'confirm' = 'login'
+    flavor: 'login' | 'confirm' = 'login',
+    redirectTo?: string | null
   ): Promise<Response> {
     const minted = await this.mintOneTimeToken(email, tokenType, createUser)
     if ('error' in minted) return minted.error
     const { code, linkToken } = minted
     const normalized = email.toLowerCase().trim()
     const kind = tokenType === 'otp' ? 'magiclink' : tokenType
-    const link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
+    let link = `${this.config.siteUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
+    if (redirectTo) {
+      const resolved = resolveRedirect(
+        redirectTo,
+        this.config.siteUrl,
+        this.config.uriAllowList,
+        this.config.enforceRedirectAllowList
+      )
+      link += `&redirect_to=${encodeURIComponent(resolved)}`
+    }
     await this.config.mailer.send({
       to: normalized,
       subject: tokenType === 'recovery' ? 'Reset your password' : flavor === 'confirm' ? 'Confirm your email' : 'Your login code',
@@ -493,16 +514,22 @@ export class AuthHandler {
     return json(200, {})
   }
 
-  private async sendOtp(req: Request): Promise<Response> {
+  private async sendOtp(req: Request, url: URL): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as { email?: string; create_user?: boolean }
     if (!body.email) return authError(400, 'validation_failed', 'email is required')
-    return this.issueToken(body.email, 'otp', body.create_user !== false)
+    return this.issueToken(body.email, 'otp', body.create_user !== false, 'login', url.searchParams.get('redirect_to'))
   }
 
-  private async sendRecovery(req: Request): Promise<Response> {
+  private async sendRecovery(req: Request, url: URL): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as { email?: string }
     if (!body.email) return authError(400, 'validation_failed', 'email is required')
-    return this.issueToken(body.email, 'recovery', false)
+    // GoTrue answers 200 for an address it has never seen, so the response
+    // can't be used to enumerate which emails have accounts. supabase-js apps
+    // rely on this to show "check your inbox" unconditionally.
+    const normalized = body.email.toLowerCase().trim()
+    const existing = await this.db.query(`select 1 from auth.users where email = $1`, [normalized])
+    if (existing.rows.length === 0) return json(200, {})
+    return this.issueToken(body.email, 'recovery', false, 'login', url.searchParams.get('redirect_to'))
   }
 
   /** Max wrong guesses for a one-time code before its tokens are invalidated. */

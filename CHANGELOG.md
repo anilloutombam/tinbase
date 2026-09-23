@@ -4,6 +4,19 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [Unreleased]
+
+### Fixed
+- **Auth emails now honour `redirectTo`.** `resetPasswordForEmail(email, { redirectTo })`,
+  `signInWithOtp({ options: { emailRedirectTo } })` and `signUp({ options: { emailRedirectTo } })`
+  send the target as `?redirect_to=` on `/recover`, `/otp`, `/magiclink`, `/resend` and
+  `/signup`. It was silently ignored, so every emailed link redirected to the bare site URL
+  and a "forgot password" screen at `/reset-password` was never reached. The link now carries
+  `redirect_to` (checked against the same allow-list `GET /verify` enforces), matching GoTrue.
+- **`POST /recover` for an unknown email returns `200 {}`** instead of `422 otp_disabled`,
+  as GoTrue does, so the response cannot be used to enumerate which addresses have accounts
+  and apps can show "check your inbox" unconditionally.
+
 ## [0.14.0]
 
 ### Added
