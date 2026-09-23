@@ -6,6 +6,17 @@ All notable changes to tinbase are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **PKCE for email links.** A `flowType: 'pkce'` client (the default in Supabase's SSR /
+  Next.js helpers) sends `code_challenge` with `/recover`, `/otp`, `/magiclink`, `/resend`
+  and `/signup`. The challenge is parked in `auth.flow_state` (`provider = 'email'`, as
+  GoTrue does) and `GET /verify` then redirects to `redirect_to?code=…` for
+  `exchangeCodeForSession` — the existing `POST /token?grant_type=pkce` exchange OAuth
+  already uses — instead of putting the session tokens in the URL fragment. Previously the
+  challenge was ignored, the client received a hash it wasn't expecting, and password
+  recovery / magic links silently failed on PKCE clients. `verifyOtp` with the typed code
+  is unchanged and returns a session directly in both flows.
+
 ### Fixed
 - **Auth emails now honour `redirectTo`.** `resetPasswordForEmail(email, { redirectTo })`,
   `signInWithOtp({ options: { emailRedirectTo } })` and `signUp({ options: { emailRedirectTo } })`
