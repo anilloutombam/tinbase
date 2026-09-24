@@ -4,18 +4,7 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
-## [Unreleased]
-
-### Changed
-- **The recovery email offers the link only — no 6-digit code.** GoTrue's default Reset Password
-  template carries just the link, and sending a code alongside it was worse than redundant: a
-  6-digit code is a far weaker credential for taking over an account than the 32-character link
-  token, it survives being forwarded, and an app that never built a code-entry screen strands
-  whoever tries to use it. The code is still minted, so `verifyOtp({ email, token, type:
-  'recovery' })` keeps working for an app that does have that screen. Login-OTP and
-  confirmation emails still show the code, where it is the point.
-
-## [Unreleased]
+## [0.15.4]
 
 ### Added
 - **Auth email templates**, in GoTrue's shape. `[auth.email.template.<type>]` in `config.toml`
@@ -29,6 +18,15 @@ All notable changes to tinbase are documented here. The format follows
   part is derived from the HTML so the message stays multipart. Types without a template keep
   the built-in default, and an unreadable `content_path` is a startup error rather than a
   silent fallback to mail the project believes it replaced.
+
+### Changed
+- **The recovery email offers the link only — no 6-digit code.** GoTrue's default Reset Password
+  template carries just the link, and sending a code alongside it was worse than redundant: a
+  6-digit code is a far weaker credential for taking over an account than the 32-character link
+  token, it survives being forwarded, and an app that never built a code-entry screen strands
+  whoever tries to use it. The code is still minted, so `verifyOtp({ email, token, type:
+  'recovery' })` keeps working for an app that does have that screen. Login-OTP and
+  confirmation emails still show the code, where it is the point.
 
 ## [0.15.3]
 
