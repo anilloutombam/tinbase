@@ -58,6 +58,12 @@ export interface AuthConfig {
   sessionInactivitySeconds?: number
   /** OAuth providers from [auth.external.*] and env-var fallbacks */
   oauthProviders: Record<string, OAuthProviderConfig>
+  /**
+   * [auth.email.template.*]: per-type `subject` and `content_path`. The path is
+   * recorded, not read - loading files is the CLI's job, since config parsing
+   * is shared with the browser build.
+   */
+  emailTemplates?: Record<string, { subject?: string; contentPath?: string }>
 }
 
 /** The `[api]` slice of config.toml. */
@@ -124,6 +130,9 @@ function readAuth(root: ConfigTable, env: NodeJS.ProcessEnv): AuthConfig {
   const rateLimits = readRateLimits(root)
   if (rateLimits) out.rateLimits = rateLimits
 
+  const templates = readEmailTemplates(root)
+  if (templates) out.emailTemplates = templates
+
   const sessions = tableAt(root, 'auth.sessions')
   const timebox = getDurationSeconds(sessions, 'timebox')
   if (timebox !== undefined) out.sessionTimeboxSeconds = timebox
@@ -131,6 +140,25 @@ function readAuth(root: ConfigTable, env: NodeJS.ProcessEnv): AuthConfig {
   if (inactivity !== undefined) out.sessionInactivitySeconds = inactivity
 
   return out
+}
+
+/**
+ * `[auth.email.template.<name>]` blocks: `subject` and `content_path`, exactly
+ * as Supabase's config.toml spells them. The body itself is left on disk for
+ * the CLI to read - this module also runs where there is no filesystem.
+ */
+function readEmailTemplates(root: ConfigTable): Record<string, { subject?: string; contentPath?: string }> | undefined {
+  const templates = tableAt(root, 'auth.email.template')
+  if (!templates) return undefined
+  const out: Record<string, { subject?: string; contentPath?: string }> = {}
+  for (const name of templates.children.keys()) {
+    const t = templates.children.get(name)
+    const subject = getString(t, 'subject')
+    const contentPath = getString(t, 'content_path')
+    if (subject === undefined && contentPath === undefined) continue
+    out[name] = { ...(subject !== undefined ? { subject } : {}), ...(contentPath !== undefined ? { contentPath } : {}) }
+  }
+  return Object.keys(out).length ? out : undefined
 }
 
 /** The [auth]/[auth.email]/[auth.mfa] keys that become AuthSettings defaults. */

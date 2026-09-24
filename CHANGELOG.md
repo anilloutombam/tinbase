@@ -15,6 +15,21 @@ All notable changes to tinbase are documented here. The format follows
   'recovery' })` keeps working for an app that does have that screen. Login-OTP and
   confirmation emails still show the code, where it is the point.
 
+## [Unreleased]
+
+### Added
+- **Auth email templates**, in GoTrue's shape. `[auth.email.template.<type>]` in `config.toml`
+  takes a `subject` and a `content_path`, and the HTML may interpolate
+  `{{ .ConfirmationURL }}`, `{{ .Token }}`, `{{ .TokenHash }}`, `{{ .RedirectTo }}`,
+  `{{ .SiteURL }}` and `{{ .Email }}` — the same names Supabase's dashboard templates use, so
+  a project can move between the two without rewriting its mail. What a message offers is
+  therefore the project's decision rather than ours: a link, a 6-digit code for an app with a
+  code-entry screen, or a `{{ .RedirectTo }}?token_hash={{ .TokenHash }}` link straight to its
+  own page, which is the shape that survives being opened on a different device. A plain-text
+  part is derived from the HTML so the message stays multipart. Types without a template keep
+  the built-in default, and an unreadable `content_path` is a startup error rather than a
+  silent fallback to mail the project believes it replaced.
+
 ## [0.15.3]
 
 ### Fixed

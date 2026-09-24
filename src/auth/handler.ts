@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword } from './password.js'
 import { qrSvgDataUri } from './qr.js'
 import { DEFAULT_AUTH_SETTINGS, type AuthSettings } from './settings.js'
 import { resolveRedirect } from './redirect.js'
+import { htmlToText, renderTemplate, type EmailTemplateName, type EmailTemplates } from './templates.js'
 import { RateLimiter } from './rate-limit.js'
 import { generateTotpSecret, otpauthUri, verifyTotp } from './totp.js'
 
@@ -25,6 +26,13 @@ export interface AuthConfig {
   sessionTimeboxSeconds?: number
   /** sends outgoing auth email (magic links, OTP codes, recovery) */
   mailer: Mailer
+  /**
+   * Per-type HTML overrides from `[auth.email.template.*]`. A project that
+   * supplies one decides for itself what the mail offers - link, code, both, or
+   * a link straight to its own page - by which variables it interpolates.
+   * Types without an override keep the built-in default.
+   */
+  emailTemplates?: EmailTemplates
   /** OAuth providers to enable, keyed by provider name (google, github, …) */
   oauthProviders?: Record<string, OAuthProviderConfig>
   /** injectable fetch for the OAuth provider calls (tests use a mock provider) */
@@ -587,16 +595,34 @@ export class AuthHandler {
         : flavor === 'confirm'
           ? { subject: 'Confirm your email', action: 'Confirm your email', lead: 'Confirm your email address with this link:', code }
           : { subject: 'Your login code', action: 'Sign in', lead: 'Sign in with this link:', code }
+    const templateName: EmailTemplateName =
+      tokenType === 'recovery' ? 'recovery' : flavor === 'confirm' ? 'confirmation' : 'magic_link'
+    const template = this.config.emailTemplates?.[templateName]
+    const defaultText =
+      tokenType === 'recovery'
+        ? `Reset your password with this link: ${link}`
+        : flavor === 'confirm'
+          ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
+          : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`
+    // A project's template replaces the body outright; its text companion is
+    // derived from it so the message stays multipart. `code` is always exposed
+    // here even though the default recovery mail omits it - a template that
+    // interpolates {{ .Token }} is a project saying it has a code-entry screen.
+    const html = template?.content
+      ? renderTemplate(template.content, {
+          ConfirmationURL: link,
+          Token: code,
+          TokenHash: linkToken,
+          RedirectTo: redirectTo,
+          SiteURL: this.config.siteUrl,
+          Email: normalized,
+        })
+      : authEmailHtml({ lead: copy.lead, action: copy.action, link, code: copy.code })
     await this.config.mailer.send({
       to: normalized,
-      subject: copy.subject,
-      text:
-        tokenType === 'recovery'
-          ? `Reset your password with this link: ${link}`
-          : flavor === 'confirm'
-            ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
-            : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`,
-      html: authEmailHtml({ lead: copy.lead, action: copy.action, link, code: copy.code }),
+      subject: template?.subject ?? copy.subject,
+      text: template?.content ? htmlToText(html) : defaultText,
+      html,
     })
     return json(200, {})
   }

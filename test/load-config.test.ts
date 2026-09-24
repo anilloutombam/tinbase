@@ -210,3 +210,29 @@ secret = "toml-secret"
     expect(p.google?.clientId).toBe('a')
   })
 })
+
+describe('loadProjectConfig — [auth.email.template.*]', () => {
+  it('reads subject and content_path per type, leaving the file on disk', () => {
+    const dir = project(`
+[auth.email.template.recovery]
+subject = "Your reset code"
+content_path = "./supabase/templates/recovery.html"
+
+[auth.email.template.magic_link]
+content_path = "./supabase/templates/magic_link.html"
+`)
+    const cfg = loadProjectConfig(dir)
+    expect(cfg.auth.emailTemplates).toEqual({
+      recovery: { subject: 'Your reset code', contentPath: './supabase/templates/recovery.html' },
+      magic_link: { contentPath: './supabase/templates/magic_link.html' },
+    })
+  })
+
+  it('is undefined when no template block is present', () => {
+    expect(loadProjectConfig(project(`[auth]\nenabled = true\n`)).auth.emailTemplates).toBeUndefined()
+  })
+
+  it('ignores a block that names neither a subject nor a path', () => {
+    expect(loadProjectConfig(project(`[auth.email.template.recovery]\n`)).auth.emailTemplates).toBeUndefined()
+  })
+})
