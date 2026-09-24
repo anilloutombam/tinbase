@@ -4,7 +4,7 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
-## [Unreleased]
+## [0.15.3]
 
 ### Fixed
 - **Auth emails are sent as HTML as well as text.** A text-only mail leaves the client to find
