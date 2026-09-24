@@ -688,6 +688,27 @@ async function main(): Promise<void> {
     }
   }
 
+  // Load the bodies named by [auth.email.template.*].content_path. Read here
+  // rather than in load-config because that module is shared with the browser
+  // build, which has no filesystem. A missing or unreadable file is a startup
+  // error: silently falling back to the default would mail a template the
+  // project believes it replaced.
+  const emailTemplates: Record<string, { subject?: string; content?: string }> = {}
+  for (const [name, t] of Object.entries(cfg.auth.emailTemplates ?? {})) {
+    const entry: { subject?: string; content?: string } = {}
+    if (t.subject !== undefined) entry.subject = t.subject
+    if (t.contentPath) {
+      const file = resolve(opts.dir, t.contentPath)
+      try {
+        entry.content = readFileSync(file, 'utf8')
+      } catch (e) {
+        console.error(`auth.email.template.${name}: cannot read ${file}: ${e instanceof Error ? e.message : String(e)}`)
+        process.exit(1)
+      }
+    }
+    emailTemplates[name] = entry
+  }
+
   const siteUrl = process.env.TINBASE_SITE_URL || cfg.auth.siteUrl || `http://${opts.host}:${port}`
 
   // Allowed redirect targets for emailed links, merged from two sources: the
@@ -710,6 +731,7 @@ async function main(): Promise<void> {
     dataDir: opts.engine === 'native' ? undefined : dataDir,
     jwtSecret: opts.jwtSecret,
     mailer,
+    emailTemplates,
     // The public URL emailed links and redirects are built on. TINBASE_SITE_URL
     // wins (a platform injects the workload's public route - the bound address
     // inside a container is meaningless to a user's mail client), then
@@ -766,6 +788,7 @@ async function main(): Promise<void> {
            API URL: ${server.url}
           Admin UI: ${server.url}/_/
              Email: ${mailer ? `Resend (from ${mailFrom})` : `dev inbox at ${server.url}/inbox (not delivered)`}
+    Mail templates: ${Object.keys(emailTemplates).length ? Object.keys(emailTemplates).join(', ') : 'built-in defaults'}
           Site URL: ${siteUrl}
     Redirects to: ${uriAllowList.length ? uriAllowList.join(', ') : 'the site URL origin only'}
             Engine: ${opts.engine === 'native' ? `native postgres (${dataDir})` : opts.engine === 'pgmem' ? 'pg-mem (in-memory, lite)' : `PGlite (${opts.memory ? 'in-memory' : dataDir})`}

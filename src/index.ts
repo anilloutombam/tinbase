@@ -36,6 +36,7 @@ export { createPgliteEngine } from './db/pglite-engine.js'
 export { MemoryStorageDriver } from './storage/driver.js'
 export { InboxMailer, type InboxEntry } from './auth/inbox.js'
 export { ResendMailer, type ResendMailerOptions } from './auth/resend.js'
+export { renderTemplate, htmlToText, type EmailTemplate, type EmailTemplates, type EmailTemplateName, type TemplateVars } from './auth/templates.js'
 export { LogBuffer, type LogEntry, type LogLevel } from './log-buffer.js'
 export { RealtimeEngine, type RealtimeSocketLike } from './realtime/engine.js'
 export { signJwt, verifyJwt, decodeJwt, deriveApiKeys } from './jwt.js'
@@ -246,6 +247,7 @@ export async function createBackend(config: BackendConfig = {}): Promise<Tinbase
     jwtExpiry,
     sessionTimeboxSeconds: config.sessionTimeboxSeconds,
     mailer,
+    emailTemplates: config.emailTemplates,
     oauthProviders: config.oauthProviders,
     oauthFetch: config.oauthFetch,
     uriAllowList: config.uriAllowList,

@@ -88,6 +88,13 @@ export interface BackendConfig {
   functionEnv?: Record<string, string>
   /** Mail transport for OTP/magic-link/recovery emails. Default: console logger. */
   mailer?: Mailer
+  /**
+   * Per-type auth email bodies (config.toml `[auth.email.template.*]`), as
+   * GoTrue templates. A project decides what its mail offers - link, code, or a
+   * link straight to its own page - by which `{{ .Variable }}` it uses. Types
+   * without an override keep the built-in default.
+   */
+  emailTemplates?: import('./auth/templates.js').EmailTemplates
   /** OAuth providers, e.g. { google: { clientId, clientSecret } }. Served at /auth/v1/authorize. */
   oauthProviders?: Record<string, import('./auth/oauth.js').OAuthProviderConfig>
   /** Injectable fetch for OAuth provider calls (tests point this at a mock provider). */
