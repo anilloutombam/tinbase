@@ -4,6 +4,18 @@ All notable changes to tinbase are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow semver
 (pre-1.0, minor bumps may include breaking changes).
 
+## [Unreleased]
+
+### Fixed
+- **Auth emails are sent as HTML as well as text.** A text-only mail leaves the client to find
+  the URL by pattern-matching, and an auth link defeats that: Gmail on Android linkified only
+  the scheme and host of a 210-character recovery link and dropped `/auth/v1/verify?...`, so
+  tapping it landed on the API root — `{"name":"tinbase","status":"healthy"}` — instead of the
+  reset page. The HTML part states the target in an `<a href>`, with the full address repeated
+  as copyable text and the code shown for clients that strip anchors. Plain inline styling
+  only: no images, no external CSS, nothing that gets blocked or scores as spam. `MailMessage`
+  gains an optional `html`, which the Resend transport sends alongside `text`.
+
 ## [0.15.2]
 
 ### Fixed

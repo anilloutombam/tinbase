@@ -89,6 +89,36 @@ interface EmailFlowOptions {
   codeChallengeMethod?: string | null
 }
 
+/** Escape a value for interpolation into HTML text or an attribute. */
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
+}
+
+/**
+ * The HTML body of an auth email: a real `<a href>` for the link, plus the code.
+ *
+ * A text-only mail leaves the client to find the URL by pattern-matching, and a
+ * long auth link (query string, percent-encoded `redirect_to`) defeats that -
+ * Gmail on Android linkified only `https://<host>` of a 210-character recovery
+ * link and dropped `/auth/v1/verify?...`, so the tap landed on the API root.
+ * With an anchor the target is declared, not inferred.
+ *
+ * Deliberately plain inline HTML: no images, no external CSS, no web fonts -
+ * the things that get stripped, blocked, or land mail in spam.
+ */
+function authEmailHtml(o: { lead: string; action: string; link: string; code: string }): string {
+  const href = escapeHtml(o.link)
+  return [
+    `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.5;color:#1a1a1a">`,
+    `<p style="margin:0 0 20px">${escapeHtml(o.lead)}</p>`,
+    `<p style="margin:0 0 24px"><a href="${href}" style="display:inline-block;padding:12px 20px;background:#1a1a1a;color:#fff;text-decoration:none;border-radius:8px">${escapeHtml(o.action)}</a></p>`,
+    `<p style="margin:0 0 8px;color:#666;font-size:14px">Or use this code:</p>`,
+    `<p style="margin:0 0 24px;font-size:24px;letter-spacing:3px;font-weight:600">${escapeHtml(o.code)}</p>`,
+    `<p style="margin:0;color:#888;font-size:13px">If the button does not work, copy this address into your browser:<br><span style="word-break:break-all">${escapeHtml(o.link)}</span></p>`,
+    `</div>`,
+  ].join('')
+}
+
 /** A cryptographically-random numeric OTP of `length` digits (6-10). */
 function randomOtp(length: number): string {
   const n = Math.max(6, Math.min(10, Math.floor(length)))
@@ -537,15 +567,22 @@ export class AuthHandler {
         [linkToken, redirectTo, opts.codeChallenge, opts.codeChallengeMethod, `${this.settings.otpExpirySeconds} seconds`]
       )
     }
+    const copy =
+      tokenType === 'recovery'
+        ? { subject: 'Reset your password', action: 'Reset your password', lead: 'Reset your password with this link:' }
+        : flavor === 'confirm'
+          ? { subject: 'Confirm your email', action: 'Confirm your email', lead: 'Confirm your email address with this link:' }
+          : { subject: 'Your login code', action: 'Sign in', lead: 'Sign in with this link:' }
     await this.config.mailer.send({
       to: normalized,
-      subject: tokenType === 'recovery' ? 'Reset your password' : flavor === 'confirm' ? 'Confirm your email' : 'Your login code',
+      subject: copy.subject,
       text:
         tokenType === 'recovery'
           ? `Reset your password with this link: ${link}\n\nOr use code ${code}`
           : flavor === 'confirm'
             ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
             : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`,
+      html: authEmailHtml({ lead: copy.lead, action: copy.action, link, code }),
     })
     return json(200, {})
   }

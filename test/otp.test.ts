@@ -182,3 +182,37 @@ describe('otp / magic links / recovery', () => {
     expect(lastLink()).toContain(`redirect_to=${encodeURIComponent('http://app.local/welcome')}`)
   })
 })
+
+describe('auth email html', () => {
+  it('carries the link as a real anchor, so a client cannot mis-linkify it', async () => {
+    const redirectTo = 'http://app.local/reset-password'
+    await supabase.auth.signUp({ email: 'html@example.com', password: 'oldpassword1' })
+    await supabase.auth.signOut()
+    await supabase.auth.resetPasswordForEmail('html@example.com', { redirectTo })
+
+    const mail = outbox[outbox.length - 1]
+    const link = mail.text.match(/(http\S+verify\S+)/)![1]
+    expect(mail.html).toBeTruthy()
+    // the exact target is declared in an href - the failure this guards is a
+    // mail client linkifying only "https://host" of a long plain-text URL
+    expect(mail.html).toContain(`href="${link.replace(/&/g, '&amp;')}"`)
+    // ...and the full address is repeated as copyable text for clients that strip anchors
+    expect(mail.html).toContain(link.replace(/&/g, '&amp;'))
+    expect(mail.html).toContain(mail.text.match(/code (\d{6})/)![1])
+  })
+
+  it('escapes the href so the query string survives as written', async () => {
+    await supabase.auth.signInWithOtp({
+      email: 'escape@example.com',
+      options: { emailRedirectTo: 'http://app.local/cb?a=1&b=2' },
+    })
+    const mail = outbox[outbox.length - 1]
+    const link = mail.text.match(/(http\S+verify\S+)/)![1]
+    const href = mail.html!.match(/<a href="([^"]*)"/)![1]
+    // `&` between query params must be an entity, or a parser may swallow it;
+    // decoding the attribute has to give back exactly the link we mailed
+    expect(href).toContain('&amp;')
+    expect(href).not.toMatch(/&(?!amp;|quot;|lt;|gt;|#39;)/)
+    expect(href.replace(/&amp;/g, '&')).toBe(link)
+  })
+})

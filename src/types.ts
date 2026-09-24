@@ -130,6 +130,17 @@ export interface MailMessage {
   subject: string
   /** Plain-text body. Carries OTP codes / magic links, so it is not logged by default. */
   text: string
+  /**
+   * HTML body, sent alongside `text` as a multipart alternative.
+   *
+   * Not decoration: a bare URL in a text-only mail is linkified by the client's
+   * own guesswork, and a long auth link (query string, percent-encoded
+   * `redirect_to`) gets truncated by that guesswork - Gmail on Android opened
+   * only the scheme and host of a 210-character recovery link, landing the user
+   * on the API root instead of the reset page. An `<a href>` states the target
+   * exactly, so there is nothing to guess.
+   */
+  html?: string
 }
 
 /** Pluggable mail transport. Default implementation logs to the console. */
