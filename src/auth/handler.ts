@@ -106,14 +106,18 @@ function escapeHtml(s: string): string {
  * Deliberately plain inline HTML: no images, no external CSS, no web fonts -
  * the things that get stripped, blocked, or land mail in spam.
  */
-function authEmailHtml(o: { lead: string; action: string; link: string; code: string }): string {
+function authEmailHtml(o: { lead: string; action: string; link: string; code: string | null }): string {
   const href = escapeHtml(o.link)
   return [
     `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.5;color:#1a1a1a">`,
     `<p style="margin:0 0 20px">${escapeHtml(o.lead)}</p>`,
     `<p style="margin:0 0 24px"><a href="${href}" style="display:inline-block;padding:12px 20px;background:#1a1a1a;color:#fff;text-decoration:none;border-radius:8px">${escapeHtml(o.action)}</a></p>`,
-    `<p style="margin:0 0 8px;color:#666;font-size:14px">Or use this code:</p>`,
-    `<p style="margin:0 0 24px;font-size:24px;letter-spacing:3px;font-weight:600">${escapeHtml(o.code)}</p>`,
+    ...(o.code
+      ? [
+          `<p style="margin:0 0 8px;color:#666;font-size:14px">Or use this code:</p>`,
+          `<p style="margin:0 0 24px;font-size:24px;letter-spacing:3px;font-weight:600">${escapeHtml(o.code)}</p>`,
+        ]
+      : []),
     `<p style="margin:0;color:#888;font-size:13px">If the button does not work, copy this address into your browser:<br><span style="word-break:break-all">${escapeHtml(o.link)}</span></p>`,
     `</div>`,
   ].join('')
@@ -567,22 +571,32 @@ export class AuthHandler {
         [linkToken, redirectTo, opts.codeChallenge, opts.codeChallengeMethod, `${this.settings.otpExpirySeconds} seconds`]
       )
     }
+    // Whether the 6-digit code is offered alongside the link.
+    //
+    // Not for recovery: GoTrue's default Reset Password template carries only
+    // the link, and a 6-digit code is a far weaker credential for taking over
+    // an account than a 32-character token - it survives being forwarded and
+    // only has the attempt cap standing behind it. Offering it also strands
+    // anyone who tries to use it, since an app that never built a code-entry
+    // screen has nowhere to type it. The code row is still minted, so
+    // `verifyOtp({ email, token, type: 'recovery' })` keeps working for an app
+    // that does implement that screen.
     const copy =
       tokenType === 'recovery'
-        ? { subject: 'Reset your password', action: 'Reset your password', lead: 'Reset your password with this link:' }
+        ? { subject: 'Reset your password', action: 'Reset your password', lead: 'Reset your password with this link:', code: null }
         : flavor === 'confirm'
-          ? { subject: 'Confirm your email', action: 'Confirm your email', lead: 'Confirm your email address with this link:' }
-          : { subject: 'Your login code', action: 'Sign in', lead: 'Sign in with this link:' }
+          ? { subject: 'Confirm your email', action: 'Confirm your email', lead: 'Confirm your email address with this link:', code }
+          : { subject: 'Your login code', action: 'Sign in', lead: 'Sign in with this link:', code }
     await this.config.mailer.send({
       to: normalized,
       subject: copy.subject,
       text:
         tokenType === 'recovery'
-          ? `Reset your password with this link: ${link}\n\nOr use code ${code}`
+          ? `Reset your password with this link: ${link}`
           : flavor === 'confirm'
             ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
             : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`,
-      html: authEmailHtml({ lead: copy.lead, action: copy.action, link, code }),
+      html: authEmailHtml({ lead: copy.lead, action: copy.action, link, code: copy.code }),
     })
     return json(200, {})
   }
