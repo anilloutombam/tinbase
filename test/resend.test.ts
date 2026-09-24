@@ -55,3 +55,21 @@ describe('ResendMailer', () => {
     expect(isValidFrom('<>')).toBe(false)
   })
 })
+
+describe('html bodies', () => {
+  it('sends html alongside text when the message has one', async () => {
+    const { fetch, calls } = fakeFetch(200, { id: 'msg_2' })
+    const mailer = new ResendMailer({ apiKey: 're_test', from: 'noreply@example.com', fetch })
+    await mailer.send({ to: 'a@example.com', subject: 'Reset your password', text: 'link', html: '<a href="x">Reset</a>' })
+    const sent = JSON.parse(calls[0].init.body as string)
+    expect(sent.text).toBe('link')
+    expect(sent.html).toBe('<a href="x">Reset</a>')
+  })
+
+  it('omits the html key entirely for a text-only message', async () => {
+    const { fetch, calls } = fakeFetch(200, { id: 'msg_3' })
+    const mailer = new ResendMailer({ apiKey: 're_test', from: 'noreply@example.com', fetch })
+    await mailer.send({ to: 'a@example.com', subject: 's', text: 'only text' })
+    expect(JSON.parse(calls[0].init.body as string)).not.toHaveProperty('html')
+  })
+})

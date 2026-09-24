@@ -45,7 +45,15 @@ export class ResendMailer implements Mailer {
         authorization: `Bearer ${this.opts.apiKey}`,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ from: this.opts.from, to: [msg.to], subject: msg.subject, text: msg.text }),
+      // Both parts when there is an HTML body: the client picks, and a text-only
+      // reader still gets the link. Resend rejects a request carrying neither.
+      body: JSON.stringify({
+        from: this.opts.from,
+        to: [msg.to],
+        subject: msg.subject,
+        text: msg.text,
+        ...(msg.html ? { html: msg.html } : {}),
+      }),
     })
     if (!res.ok) {
       // Surface Resend's reason (unverified domain, bad key, rate limit) without
