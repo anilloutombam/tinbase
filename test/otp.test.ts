@@ -9,6 +9,19 @@ const outbox: MailMessage[] = []
 const lastCode = () => outbox[outbox.length - 1].text.match(/code is (\d{6})|use code (\d{6})/)?.slice(1).find(Boolean)
 const lastLink = () => outbox[outbox.length - 1].text.match(/(http\S+verify\S+)/)?.[1]
 
+/**
+ * The 6-digit recovery code. Minted like any other, but deliberately not put in
+ * the recovery email (a weaker credential than the link, and most apps have no
+ * screen to type it into), so a test that needs it reads it from the database.
+ */
+const recoveryCodeFor = async (email: string): Promise<string> => {
+  const res = await backend.db.query(
+    `select token from auth.one_time_tokens where email = $1 and token_type = 'recovery' and token ~ '^[0-9]{6}$'`,
+    [email]
+  )
+  return (res.rows[0] as { token: string }).token
+}
+
 beforeAll(async () => {
   backend = await createBackend({ mailer: { send: async (m) => void outbox.push(m) } })
   supabase = createClient('http://localhost:54321', backend.anonKey, {
@@ -58,7 +71,9 @@ describe('otp / magic links / recovery', () => {
 
     const { error } = await supabase.auth.resetPasswordForEmail('reset@example.com')
     expect(error).toBeNull()
-    const code = lastCode()!
+    // the code is minted but deliberately not mailed for recovery (see below);
+    // read it from the link token's sibling row via the admin endpoint instead
+    const code = await recoveryCodeFor('reset@example.com')
 
     const verified = await supabase.auth.verifyOtp({ email: 'reset@example.com', token: code, type: 'recovery' })
     expect(verified.error).toBeNull()
@@ -198,7 +213,6 @@ describe('auth email html', () => {
     expect(mail.html).toContain(`href="${link.replace(/&/g, '&amp;')}"`)
     // ...and the full address is repeated as copyable text for clients that strip anchors
     expect(mail.html).toContain(link.replace(/&/g, '&amp;'))
-    expect(mail.html).toContain(mail.text.match(/code (\d{6})/)![1])
   })
 
   it('escapes the href so the query string survives as written', async () => {
@@ -214,5 +228,28 @@ describe('auth email html', () => {
     expect(href).toContain('&amp;')
     expect(href).not.toMatch(/&(?!amp;|quot;|lt;|gt;|#39;)/)
     expect(href.replace(/&amp;/g, '&')).toBe(link)
+  })
+})
+
+describe('recovery email contents', () => {
+  it('offers the link only - no 6-digit code', async () => {
+    await supabase.auth.signUp({ email: 'nocode@example.com', password: 'oldpassword1' })
+    await supabase.auth.signOut()
+    await supabase.auth.resetPasswordForEmail('nocode@example.com', { redirectTo: 'http://app.local/reset' })
+
+    const mail = outbox[outbox.length - 1]
+    // A 6-digit code is a weaker account-takeover credential than the link
+    // token, and an app with no code-entry screen strands whoever tries it.
+    expect(mail.text).not.toMatch(/\b\d{6}\b/)
+    expect(mail.html).not.toMatch(/>\s*\d{6}\s*</)
+    expect(mail.text).toContain('/auth/v1/verify')
+    expect(mail.html).toContain('href=')
+  })
+
+  it('still offers the code for a login OTP, where it is the point', async () => {
+    await supabase.auth.signInWithOtp({ email: 'stillcode@example.com' })
+    const mail = outbox[outbox.length - 1]
+    expect(mail.text).toMatch(/\b\d{6}\b/)
+    expect(mail.html).toMatch(/>\s*\d{6}\s*</)
   })
 })
